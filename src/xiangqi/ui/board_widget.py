@@ -127,6 +127,17 @@ class BoardWidget(QWidget):
 
         coord = self.coord_at(event.position())
         state = self.controller.get_state()
+        if state.replay_cursor is not None:
+            self._clear_selection()
+            return
+        player = next(
+            player
+            for player in self.controller.record.players
+            if player.color is state.side_to_move
+        )
+        if player.controller != ControllerKind.HUMAN.value:
+            self._clear_selection()
+            return
         if state.controllers[state.side_to_move].kind is not ControllerKind.HUMAN:
             self._clear_selection()
             return
