@@ -8,7 +8,7 @@ extending :class:`MoveNature`, without changing stored position frames.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -58,12 +58,13 @@ _PIECE_VALUE = {
 }
 
 
-def _capture_is_rooted(board: Board, attacker: Coord, target: Coord, side: Color) -> bool:
+def _capture_is_rooted(
+    board: Board, attacker: Coord, target: Coord, side: Color
+) -> bool:
     """Whether a legal recapture protects target (pinned pseudo-roots do not)."""
     after_capture = board.move_unchecked(attacker, target)
     return any(
-        move.end == target
-        for move in all_legal_moves(after_capture, side.opponent)
+        move.end == target for move in all_legal_moves(after_capture, side.opponent)
     )
 
 
@@ -182,8 +183,7 @@ class PositionFrame:
         elif _has_forced_mate_next_move(board_after, side):
             nature = MoveNature.KILL
         elif any(
-            attack.attacker_piece.kind
-            not in (PieceType.GENERAL, PieceType.PAWN)
+            attack.attacker_piece.kind not in (PieceType.GENERAL, PieceType.PAWN)
             and (not attack.rooted or attack.target_value > attack.attacker_value)
             for attack in attacks
         ):
@@ -218,6 +218,12 @@ class RuleAdjudicator(Protocol):
     ruleset: Ruleset
 
     def evaluate(self, history: Sequence[PositionFrame]) -> Adjudication: ...
+
+    def evaluate_natures(
+        self, by_side: Mapping[Color, Sequence[MoveNature]]
+    ) -> Adjudication: ...
+
+    def loss_for_ignored_must_change(self, decision: Adjudication) -> Adjudication: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,114 +297,166 @@ def _no_decision(ruleset: Ruleset, reference: str) -> Adjudication:
     )
 
 
-def _result_for_cycle(
-    cycle: _Cycle,
+def _labels(natures: Sequence[MoveNature]) -> str:
+    labels = {
+        MoveNature.CHECK: "将",
+        MoveNature.CHASE: "捉",
+        MoveNature.KILL: "杀",
+    }
+    unique = tuple(
+        dict.fromkeys(labels[nature] for nature in natures if nature in labels)
+    )
+    if len(unique) == 1:
+        return f"长{unique[0]}"
+    return "".join(f"一{label}" for label in unique).removeprefix("一")
+
+
+def _make_result(
+    *,
+    by_side: Mapping[Color, Sequence[MoveNature]],
+    cycle_start: int | None,
     ruleset: Ruleset,
     reference: str,
-    repetition_reason: str,
-    prohibited,
+    kind: AdjudicationKind,
+    responsible: Color | None,
+    reason: str,
+    ordered_natures: Sequence[MoveNature] | None = None,
 ) -> Adjudication:
-    natures = tuple(frame.nature for frame in cycle.frames)
-    by_side = _natures_by_side(cycle)
-    offenders = [color for color, kinds in by_side.items() if prohibited(kinds)]
-    if len(offenders) == 1:
-        responsible = offenders[0]
-        responsible_natures = tuple(
-            frame.nature for frame in cycle.frames if frame.side is responsible
+    flattened = (
+        tuple(ordered_natures)
+        if ordered_natures is not None
+        else tuple(
+            nature
+            for index in range(max(map(len, by_side.values()), default=0))
+            for color in Color
+            for nature in by_side.get(color, ())[index : index + 1]
         )
-        labels = {
-            MoveNature.CHECK: "长将",
-            MoveNature.CHASE: "长捉",
-            MoveNature.KILL: "长杀",
-        }
-        behavior = "、".join(dict.fromkeys(labels[kind] for kind in responsible_natures))
-        return Adjudication(
-            kind=AdjudicationKind.MUST_CHANGE,
-            ruleset=ruleset,
-            cycle_start=cycle.start,
-            responsible=responsible,
-            move_natures=natures,
-            responsible_natures=responsible_natures,
-            rule_reference=reference,
-            reason=f"单方循环构成{behavior}，须由责任方变着",
-        )
-    return Adjudication(
-        kind=AdjudicationKind.DRAW,
-        ruleset=ruleset,
-        cycle_start=cycle.start,
-        responsible=None,
-        move_natures=natures,
-        responsible_natures=(),
-        rule_reference=reference,
-        reason=repetition_reason,
     )
-
-
-def _unsupported(
-    cycle: _Cycle, ruleset: Ruleset, reference: str, reason: str
-) -> Adjudication:
     return Adjudication(
-        kind=AdjudicationKind.UNSUPPORTED,
+        kind=kind,
         ruleset=ruleset,
-        cycle_start=cycle.start,
-        responsible=None,
-        move_natures=tuple(frame.nature for frame in cycle.frames),
-        responsible_natures=(),
+        cycle_start=cycle_start,
+        responsible=responsible,
+        move_natures=flattened,
+        responsible_natures=(
+            tuple(by_side.get(responsible, ())) if responsible is not None else ()
+        ),
         rule_reference=reference,
         reason=reason,
     )
 
 
-def _evaluate_supported_cycle(
-    cycle: _Cycle,
+def _chinese_responsibility(natures: Sequence[MoveNature]) -> int:
+    """2020 rules: every all-aggressive check/kill/chase cycle is prohibited."""
+    if not natures or any(
+        nature not in {MoveNature.CHECK, MoveNature.KILL, MoveNature.CHASE}
+        for nature in natures
+    ):
+        return 0
+    return 2 if MoveNature.CHECK in natures else 1
+
+
+def _asian_responsibility(natures: Sequence[MoveNature]) -> int:
+    """2003 rules: long check/chase are prohibited; mixed attacks and kills draw."""
+    if natures and all(nature is MoveNature.CHECK for nature in natures):
+        return 2
+    if natures and all(nature is MoveNature.CHASE for nature in natures):
+        return 1
+    return 0
+
+
+def _evaluate_responsibility(
+    by_side: Mapping[Color, Sequence[MoveNature]],
     ruleset: Ruleset,
     reference: str,
-    *,
-    allow_kill: bool,
+    cycle_start: int | None,
+    ordered_natures: Sequence[MoveNature] | None = None,
 ) -> Adjudication:
-    """Apply only responsibility rows represented by verified classifiers."""
-    by_side = _natures_by_side(cycle)
-    if all(frame.nature is MoveNature.IDLE for frame in cycle.frames):
-        return _result_for_cycle(
-            cycle,
-            ruleset,
-            reference,
-            "三次相同局面且双方均为闲着，判和",
-            lambda _natures: False,
+    """Apply the formal responsibility table after tactical classification."""
+    normalized = {color: tuple(by_side.get(color, ())) for color in Color}
+    if not all(normalized.values()):
+        raise ValueError("双方均须提供循环中的着法性质")
+    classifier = (
+        _chinese_responsibility
+        if ruleset is Ruleset.CHINESE_2020
+        else _asian_responsibility
+    )
+    scores = {color: classifier(natures) for color, natures in normalized.items()}
+    offenders = [color for color, score in scores.items() if score]
+    if not offenders:
+        return _make_result(
+            by_side=normalized,
+            cycle_start=cycle_start,
+            ruleset=ruleset,
+            reference=reference,
+            kind=AdjudicationKind.DRAW,
+            responsible=None,
+            reason="双方均为允许着法（含闲着或规则允许的混合攻击），判和",
+            ordered_natures=ordered_natures,
         )
-
-    supported = {MoveNature.CHECK, MoveNature.CHASE}
-    if allow_kill:
-        supported.add(MoveNature.KILL)
-    offenders = [
-        color
-        for color, natures in by_side.items()
-        if natures and len(set(natures)) == 1 and natures[0] in supported
-    ]
-    quiet = [
-        color
-        for color, natures in by_side.items()
-        if natures and all(nature is MoveNature.IDLE for nature in natures)
-    ]
-    if len(offenders) == 1 and len(quiet) == 1:
-        prohibited = by_side[offenders[0]][0]
-        return _result_for_cycle(
-            cycle,
-            ruleset,
-            reference,
-            "",
-            lambda natures: bool(natures)
-            and all(nature is prohibited for nature in natures),
+    if len(offenders) == 2 and scores[offenders[0]] == scores[offenders[1]]:
+        return _make_result(
+            by_side=normalized,
+            cycle_start=cycle_start,
+            ruleset=ruleset,
+            reference=reference,
+            kind=AdjudicationKind.DRAW,
+            responsible=None,
+            reason="双方同时走出同等责任的禁止着法，双方不变判和",
+            ordered_natures=ordered_natures,
         )
-    return _unsupported(
-        cycle,
-        ruleset,
-        reference,
-        "该循环包含混合着法或双方责任棋例，当前受控子集不作自动裁决",
+    responsible = max(offenders, key=scores.__getitem__)
+    behavior = _labels(normalized[responsible])
+    return _make_result(
+        by_side=normalized,
+        cycle_start=cycle_start,
+        ruleset=ruleset,
+        reference=reference,
+        kind=AdjudicationKind.MUST_CHANGE,
+        responsible=responsible,
+        reason=f"责任方循环构成{behavior}类禁止着法，须由责任方变着",
+        ordered_natures=ordered_natures,
     )
 
 
-class Chinese2020Adjudicator:
+class _AdjudicatorBase:
+    ruleset: Ruleset
+    _reference: str
+
+    def evaluate_natures(
+        self, by_side: Mapping[Color, Sequence[MoveNature]]
+    ) -> Adjudication:
+        """Adjudicate an already verified cycle classification.
+
+        This public seam lets importers and tournament integrations apply the
+        responsibility table without manufacturing board histories.
+        """
+        return _evaluate_responsibility(
+            by_side, self.ruleset, self._reference, cycle_start=None
+        )
+
+    def loss_for_ignored_must_change(self, decision: Adjudication) -> Adjudication:
+        """Escalate a referee/controller MUST_CHANGE notice after noncompliance."""
+        if decision.ruleset is not self.ruleset:
+            raise ValueError("裁决规则模式不一致")
+        if (
+            decision.kind is not AdjudicationKind.MUST_CHANGE
+            or decision.responsible is None
+        ):
+            raise ValueError("只有未执行的变着裁决才能升级为判负")
+        return Adjudication(
+            kind=AdjudicationKind.LOSS,
+            ruleset=decision.ruleset,
+            cycle_start=decision.cycle_start,
+            responsible=decision.responsible,
+            move_natures=decision.move_natures,
+            responsible_natures=decision.responsible_natures,
+            rule_reference=decision.rule_reference,
+            reason=f"{decision.reason}；经要求后仍未变着，责任方判负",
+        )
+
+
+class Chinese2020Adjudicator(_AdjudicatorBase):
     ruleset = Ruleset.CHINESE_2020
     _reference = "中国棋规2020 第24至26条（棋例术语、循环与禁止着法）"
 
@@ -410,15 +468,16 @@ class Chinese2020Adjudicator:
         return self._evaluate_cycle(cycle)
 
     def _evaluate_cycle(self, cycle: _Cycle) -> Adjudication:
-        return _evaluate_supported_cycle(
-            cycle,
+        return _evaluate_responsibility(
+            _natures_by_side(cycle),
             self.ruleset,
             self._reference,
-            allow_kill=True,
+            cycle.start,
+            tuple(frame.nature for frame in cycle.frames),
         )
 
 
-class Asian2003Adjudicator:
+class Asian2003Adjudicator(_AdjudicatorBase):
     ruleset = Ruleset.ASIAN_2003
     _reference = "亚洲棋规2003 循环局面及禁止着法条款"
 
@@ -430,9 +489,10 @@ class Asian2003Adjudicator:
         return self._evaluate_cycle(cycle)
 
     def _evaluate_cycle(self, cycle: _Cycle) -> Adjudication:
-        return _evaluate_supported_cycle(
-            cycle,
+        return _evaluate_responsibility(
+            _natures_by_side(cycle),
             self.ruleset,
             self._reference,
-            allow_kill=False,
+            cycle.start,
+            tuple(frame.nature for frame in cycle.frames),
         )

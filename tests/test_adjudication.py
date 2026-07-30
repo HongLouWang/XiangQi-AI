@@ -179,6 +179,7 @@ def test_single_side_perpetual_check_must_change(adjudicator) -> None:
     assert result.cycle_start == 0
     assert result.responsible is Color.RED
     assert result.responsible_natures == (MoveNature.CHECK,) * 4
+    assert result.move_natures == (MoveNature.CHECK, MoveNature.IDLE) * 4
     assert result.ruleset is adjudicator.ruleset
     assert result.rule_reference
 
@@ -341,11 +342,126 @@ def test_rulesets_keep_independent_one_check_one_chase_policy() -> None:
     chinese = Chinese2020Adjudicator().evaluate(history)
     asian = Asian2003Adjudicator().evaluate(history)
 
-    assert chinese.kind is AdjudicationKind.UNSUPPORTED
-    assert chinese.responsible is None
-    assert asian.kind is AdjudicationKind.UNSUPPORTED
+    assert chinese.kind is AdjudicationKind.MUST_CHANGE
+    assert chinese.responsible is Color.RED
+    assert asian.kind is AdjudicationKind.DRAW
     assert asian.responsible is None
     assert chinese.rule_reference != asian.rule_reference
+
+
+@pytest.mark.parametrize(
+    ("natures", "chinese_kind", "asian_kind"),
+    [
+        (
+            (MoveNature.CHECK, MoveNature.KILL),
+            AdjudicationKind.MUST_CHANGE,
+            AdjudicationKind.DRAW,
+        ),
+        (
+            (MoveNature.CHECK, MoveNature.CHASE),
+            AdjudicationKind.MUST_CHANGE,
+            AdjudicationKind.DRAW,
+        ),
+        (
+            (MoveNature.KILL, MoveNature.CHASE),
+            AdjudicationKind.MUST_CHANGE,
+            AdjudicationKind.DRAW,
+        ),
+        ((MoveNature.KILL,), AdjudicationKind.MUST_CHANGE, AdjudicationKind.DRAW),
+        (
+            (MoveNature.CHASE,),
+            AdjudicationKind.MUST_CHANGE,
+            AdjudicationKind.MUST_CHANGE,
+        ),
+        ((MoveNature.IDLE,), AdjudicationKind.DRAW, AdjudicationKind.DRAW),
+    ],
+)
+def test_formal_single_side_responsibility_table(
+    natures, chinese_kind, asian_kind
+) -> None:
+    chinese = Chinese2020Adjudicator().evaluate_natures(
+        {Color.RED: natures, Color.BLACK: (MoveNature.IDLE,) * len(natures)}
+    )
+    asian = Asian2003Adjudicator().evaluate_natures(
+        {Color.RED: natures, Color.BLACK: (MoveNature.IDLE,) * len(natures)}
+    )
+
+    assert chinese.kind is chinese_kind
+    assert asian.kind is asian_kind
+    assert chinese.responsible is (
+        Color.RED if chinese_kind is AdjudicationKind.MUST_CHANGE else None
+    )
+    assert asian.responsible is (
+        Color.RED if asian_kind is AdjudicationKind.MUST_CHANGE else None
+    )
+
+
+@pytest.mark.parametrize(
+    "adjudicator",
+    [Chinese2020Adjudicator(), Asian2003Adjudicator()],
+)
+def test_long_check_has_priority_over_opponents_long_chase(adjudicator) -> None:
+    result = adjudicator.evaluate_natures(
+        {
+            Color.RED: (MoveNature.CHECK,) * 2,
+            Color.BLACK: (MoveNature.CHASE,) * 2,
+        }
+    )
+
+    assert result.kind is AdjudicationKind.MUST_CHANGE
+    assert result.responsible is Color.RED
+
+
+@pytest.mark.parametrize(
+    ("adjudicator", "red", "black"),
+    [
+        (
+            Chinese2020Adjudicator(),
+            (MoveNature.KILL, MoveNature.CHASE),
+            (MoveNature.CHASE, MoveNature.KILL),
+        ),
+        (
+            Asian2003Adjudicator(),
+            (MoveNature.CHASE,) * 2,
+            (MoveNature.CHASE,) * 2,
+        ),
+    ],
+)
+def test_both_sides_with_equal_responsibility_draw(adjudicator, red, black) -> None:
+    result = adjudicator.evaluate_natures({Color.RED: red, Color.BLACK: black})
+
+    assert result.kind is AdjudicationKind.DRAW
+    assert result.responsible is None
+
+
+@pytest.mark.parametrize(
+    "adjudicator",
+    [Chinese2020Adjudicator(), Asian2003Adjudicator()],
+)
+def test_ignored_must_change_has_explicit_loss_path(adjudicator) -> None:
+    first = adjudicator.evaluate(_perpetual_check_history())
+
+    result = adjudicator.loss_for_ignored_must_change(first)
+
+    assert result.kind is AdjudicationKind.LOSS
+    assert result.responsible is Color.RED
+    assert "未变着" in result.reason
+
+
+@pytest.mark.parametrize(
+    "adjudicator",
+    [Chinese2020Adjudicator(), Asian2003Adjudicator()],
+)
+def test_general_and_pawn_chase_exception_is_allowed(adjudicator) -> None:
+    result = adjudicator.evaluate_natures(
+        {
+            Color.RED: (MoveNature.IDLE,) * 2,
+            Color.BLACK: (MoveNature.IDLE,) * 2,
+        }
+    )
+
+    assert result.kind is AdjudicationKind.DRAW
+    assert "允许" in result.reason or "闲着" in result.reason
 
 
 def test_tampered_move_nature_is_rejected() -> None:
