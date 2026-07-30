@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -139,7 +139,7 @@ class GameRecord(_RecordModel):
     def created_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("创建时间必须包含时区")
-        return value
+        return value.astimezone(UTC)
 
     @model_validator(mode="after")
     def validate_record_metadata(self) -> GameRecord:

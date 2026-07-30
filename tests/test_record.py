@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -149,6 +149,18 @@ def test_created_at_is_required_and_timezone_aware() -> None:
     payload["created_at"] = datetime(2026, 7, 31)  # noqa: DTZ001 - invalid fixture
     with pytest.raises(ValidationError, match="时区"):
         GameRecord.model_validate(payload)
+
+
+def test_created_at_with_nonzero_offset_is_normalized_to_utc() -> None:
+    payload = _sample_record().model_dump()
+    payload["created_at"] = datetime(
+        2026, 7, 31, 12, tzinfo=timezone(timedelta(hours=8))
+    )
+
+    record = GameRecord.model_validate(payload)
+
+    assert record.created_at == datetime(2026, 7, 31, 4, tzinfo=UTC)
+    assert record.created_at.tzinfo is UTC
 
 
 def test_adjudication_record_round_trip_preserves_replay_evidence(tmp_path) -> None:
