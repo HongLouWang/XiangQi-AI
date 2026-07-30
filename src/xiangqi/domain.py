@@ -21,6 +21,12 @@ class PieceType(StrEnum):
     PAWN = "pawn"
 
 
+class PositionKind(StrEnum):
+    ONGOING = "ongoing"
+    CHECKMATE = "checkmate"
+    STALEMATE = "stalemate"
+
+
 @dataclass(frozen=True, slots=True)
 class Coord:
     file: int
@@ -58,3 +64,11 @@ class Move:
                 }
             ),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class PositionResult:
+    kind: PositionKind
+    side_to_move: Color
+    winner: Color | None
+    in_check: bool

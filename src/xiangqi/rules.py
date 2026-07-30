@@ -3,7 +3,15 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 
 from xiangqi.board import Board
-from xiangqi.domain import Color, Coord, Piece, PieceType
+from xiangqi.domain import (
+    Color,
+    Coord,
+    Move,
+    Piece,
+    PieceType,
+    PositionKind,
+    PositionResult,
+)
 
 
 _ORTHOGONAL_DIRECTIONS = ((0, -1), (1, 0), (0, 1), (-1, 0))
@@ -169,4 +177,105 @@ def pseudo_legal_destinations(board: Board, start: Coord) -> tuple[Coord, ...]:
         for destination in _candidate_destinations(board, start, piece)
         if (occupant := board.at(destination)) is None
         or occupant.color is not piece.color
+    )
+
+
+def _general_coord(board: Board, color: Color) -> Coord | None:
+    return next(
+        (
+            coord
+            for coord, piece in board.pieces.items()
+            if piece.color is color and piece.kind is PieceType.GENERAL
+        ),
+        None,
+    )
+
+
+def _generals_face(board: Board) -> bool:
+    red = _general_coord(board, Color.RED)
+    black = _general_coord(board, Color.BLACK)
+    if red is None or black is None or red.file != black.file:
+        return False
+    first_rank, last_rank = sorted((red.rank, black.rank))
+    return all(
+        board.at(Coord(red.file, rank)) is None
+        for rank in range(first_rank + 1, last_rank)
+    )
+
+
+def is_square_attacked(board: Board, square: Coord, by_color: Color) -> bool:
+    """Return whether a side attacks a square under piece movement rules."""
+    target = board.at(square)
+    for start, piece in board.pieces.items():
+        if piece.color is not by_color:
+            continue
+        if square in pseudo_legal_destinations(board, start):
+            return True
+
+    if (
+        target is not None
+        and target.kind is PieceType.GENERAL
+        and target.color is by_color.opponent
+        and _generals_face(board)
+    ):
+        return True
+    return False
+
+
+def is_in_check(board: Board, color: Color) -> bool:
+    general = _general_coord(board, color)
+    if general is None:
+        return True
+    return is_square_attacked(board, general, color.opponent)
+
+
+def legal_destinations(
+    board: Board, start: Coord, side_to_move: Color
+) -> tuple[Coord, ...]:
+    piece = board.at(start)
+    if piece is None or piece.color is not side_to_move:
+        return ()
+
+    legal: list[Coord] = []
+    for destination in pseudo_legal_destinations(board, start):
+        occupant = board.at(destination)
+        if occupant is not None and occupant.kind is PieceType.GENERAL:
+            continue
+        next_board = board.move_unchecked(start, destination)
+        if not is_in_check(next_board, side_to_move):
+            legal.append(destination)
+    return tuple(legal)
+
+
+def all_legal_moves(board: Board, side_to_move: Color) -> tuple[Move, ...]:
+    moves: list[Move] = []
+    for start, piece in board.pieces.items():
+        if piece.color is not side_to_move:
+            continue
+        for destination in legal_destinations(board, start, side_to_move):
+            moves.append(
+                Move(
+                    start=start,
+                    end=destination,
+                    piece=piece,
+                    captured=board.at(destination),
+                )
+            )
+    return tuple(moves)
+
+
+def evaluate_position(board: Board, side_to_move: Color) -> PositionResult:
+    in_check = is_in_check(board, side_to_move)
+    if all_legal_moves(board, side_to_move):
+        return PositionResult(
+            kind=PositionKind.ONGOING,
+            side_to_move=side_to_move,
+            winner=None,
+            in_check=in_check,
+        )
+    return PositionResult(
+        kind=PositionKind.CHECKMATE if in_check else PositionKind.STALEMATE,
+        side_to_move=side_to_move,
+        winner=side_to_move.opponent,
+        in_check=in_check,
     )
