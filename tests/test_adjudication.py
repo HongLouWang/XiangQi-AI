@@ -82,6 +82,81 @@ def _ordinary_repetition_history() -> list[PositionFrame]:
     return history
 
 
+def _rook_chase_history(
+    *, rooted: bool = False, target_kind: PieceType = PieceType.ROOK
+) -> list[PositionFrame]:
+    """A real four-ply position loop: the red rook follows the black rook."""
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+        .place(Coord(0, 5), _piece(Color.RED, PieceType.ROOK))
+        .place(Coord(1, 3), _piece(Color.BLACK, target_kind))
+    )
+    if rooted:
+        board = board.place(Coord(1, 0), _piece(Color.BLACK, PieceType.ROOK))
+    history: list[PositionFrame] = []
+    side = Color.RED
+    cycle = (
+        ((0, 5), (1, 5)),
+        ((1, 3), (0, 3)),
+        ((1, 5), (0, 5)),
+        ((0, 3), (1, 3)),
+    )
+    for _ in range(2):
+        for start, end in cycle:
+            board, frame = _play(board, side, start, end)
+            history.append(frame)
+            side = side.opponent
+    return history
+
+
+def _pawn_follow_history() -> list[PositionFrame]:
+    """The same geometric follow by a pawn is an explicit long-chase exception."""
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+        .place(Coord(0, 4), _piece(Color.RED, PieceType.PAWN))
+        .place(Coord(1, 4), _piece(Color.BLACK, PieceType.ROOK))
+    )
+    # A single transition is enough to prove classification of the exception.
+    # Rebuild it without capture: the pawn newly attacks a rook on its flank.
+    board = board.remove(Coord(1, 4)).place(
+        Coord(2, 4), _piece(Color.BLACK, PieceType.ROOK)
+    )
+    board, frame = _play(board, Color.RED, (0, 4), (1, 4))
+    return [frame]
+
+
+def _one_check_one_chase_history() -> list[PositionFrame]:
+    """A real cycle where Red alternates one check and one chase."""
+    board = (
+        Board.empty()
+        .place(Coord(3, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+        .place(Coord(2, 5), _piece(Color.RED, PieceType.ROOK))
+        .place(Coord(2, 3), _piece(Color.BLACK, PieceType.ROOK))
+    )
+    history: list[PositionFrame] = []
+    side = Color.RED
+    cycle = (
+        ((2, 5), (3, 5)),
+        ((3, 0), (4, 0)),
+        ((3, 5), (2, 5)),
+        ((4, 0), (3, 0)),
+    )
+    for _ in range(2):
+        for start, end in cycle:
+            board, frame = _play(board, side, start, end)
+            history.append(frame)
+            side = side.opponent
+    return history
+
+
 def test_position_frame_classifies_real_check_and_idle_moves() -> None:
     check_history = _perpetual_check_history()
     idle_history = _ordinary_repetition_history()
@@ -136,3 +211,183 @@ def test_two_occurrences_are_not_enough_for_a_decision(adjudicator) -> None:
 
     assert result.kind is AdjudicationKind.NO_DECISION
     assert result.cycle_start is None
+
+
+def test_position_frame_classifies_new_profitable_attack_as_chase() -> None:
+    history = _rook_chase_history()
+
+    assert [frame.nature for frame in history[:4]] == [
+        MoveNature.CHASE,
+        MoveNature.IDLE,
+        MoveNature.CHASE,
+        MoveNature.IDLE,
+    ]
+
+
+def test_position_frame_classifies_unrooted_lesser_piece_as_chase() -> None:
+    history = _rook_chase_history(target_kind=PieceType.CANNON)
+
+    assert history[0].nature is MoveNature.CHASE
+    assert history[0].attacks[0].target_piece.kind is PieceType.CANNON
+
+
+def test_a_genuinely_rooted_target_is_not_classified_as_chase() -> None:
+    history = _rook_chase_history(rooted=True)
+
+    assert history[0].nature is MoveNature.IDLE
+
+
+def test_a_pinned_defender_is_only_a_fake_root() -> None:
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(3, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(0, 5), _piece(Color.RED, PieceType.ROOK))
+        .place(Coord(4, 5), _piece(Color.RED, PieceType.ROOK))
+        .place(Coord(1, 3), _piece(Color.BLACK, PieceType.ROOK))
+        .place(Coord(4, 3), _piece(Color.BLACK, PieceType.ROOK))
+    )
+
+    _, frame = _play(board, Color.RED, (0, 5), (1, 5))
+
+    assert frame.nature is MoveNature.CHASE
+
+
+def test_a_pinned_attacker_does_not_create_a_fake_chase() -> None:
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(1, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(1, 0), _piece(Color.BLACK, PieceType.ROOK))
+        .place(Coord(0, 7), _piece(Color.RED, PieceType.HORSE))
+        .place(Coord(3, 4), _piece(Color.BLACK, PieceType.ROOK))
+    )
+
+    _, frame = _play(board, Color.RED, (0, 7), (1, 5))
+
+    assert frame.nature is MoveNature.IDLE
+    assert frame.attacks == ()
+
+
+def test_discovered_legal_attack_is_recorded_as_a_chase() -> None:
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+        .place(Coord(0, 8), _piece(Color.RED, PieceType.ROOK))
+        .place(Coord(0, 5), _piece(Color.RED, PieceType.HORSE))
+        .place(Coord(0, 3), _piece(Color.BLACK, PieceType.ROOK))
+    )
+
+    _, frame = _play(board, Color.RED, (0, 5), (2, 6))
+
+    assert frame.nature is MoveNature.CHASE
+    assert tuple(attack.target for attack in frame.attacks) == (Coord(0, 3),)
+
+
+def test_general_and_pawn_attacks_are_not_long_chase_moves() -> None:
+    assert _pawn_follow_history()[0].nature is MoveNature.IDLE
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(3, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+        .place(Coord(4, 8), _piece(Color.BLACK, PieceType.ADVISOR))
+    )
+    _, general_frame = _play(board, Color.RED, (3, 9), (4, 9))
+
+    assert general_frame.nature is MoveNature.IDLE
+
+
+def test_position_frame_classifies_a_forced_mate_next_move_as_kill() -> None:
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+        .place(Coord(0, 1), _piece(Color.RED, PieceType.ROOK))
+        .place(Coord(0, 2), _piece(Color.RED, PieceType.ROOK))
+    )
+
+    _, frame = _play(board, Color.RED, (0, 1), (1, 1))
+
+    assert frame.nature is MoveNature.KILL
+
+
+@pytest.mark.parametrize(
+    "adjudicator",
+    [Chinese2020Adjudicator(), Asian2003Adjudicator()],
+)
+def test_single_side_perpetual_chase_of_unrooted_rook_must_change(adjudicator) -> None:
+    result = adjudicator.evaluate(_rook_chase_history())
+
+    assert result.kind is AdjudicationKind.MUST_CHANGE
+    assert result.responsible is Color.RED
+    assert result.responsible_natures == (MoveNature.CHASE,) * 4
+    assert "长捉" in result.reason
+    assert result.rule_reference
+
+
+def test_rulesets_keep_independent_one_check_one_chase_policy() -> None:
+    history = _one_check_one_chase_history()
+    assert tuple(frame.nature for frame in history if frame.side is Color.RED) == (
+        MoveNature.CHECK,
+        MoveNature.CHASE,
+        MoveNature.CHECK,
+        MoveNature.CHASE,
+    )
+
+    chinese = Chinese2020Adjudicator().evaluate(history)
+    asian = Asian2003Adjudicator().evaluate(history)
+
+    assert chinese.kind is AdjudicationKind.UNSUPPORTED
+    assert chinese.responsible is None
+    assert asian.kind is AdjudicationKind.UNSUPPORTED
+    assert asian.responsible is None
+    assert chinese.rule_reference != asian.rule_reference
+
+
+def test_tampered_move_nature_is_rejected() -> None:
+    history = _ordinary_repetition_history()
+    frame = history[0]
+    object.__setattr__(frame, "nature", MoveNature.CHECK)
+
+    with pytest.raises(ValueError, match="着法性质"):
+        Chinese2020Adjudicator().evaluate(history)
+
+
+def test_illegal_transition_is_rejected() -> None:
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+        .place(Coord(0, 9), _piece(Color.RED, PieceType.ROOK))
+    )
+    move = Move(
+        Coord(0, 9),
+        Coord(1, 8),
+        _piece(Color.RED, PieceType.ROOK),
+        None,
+    )
+
+    with pytest.raises(ValueError, match="非法"):
+        PositionFrame.from_transition(
+            board,
+            Color.RED,
+            move,
+            board.move_unchecked(move.start, move.end),
+        )
+
+
+def test_frame_records_root_and_exchange_evidence() -> None:
+    unrooted = _rook_chase_history()[0]
+    rooted = _rook_chase_history(rooted=True)[0]
+
+    assert len(unrooted.attacks) == 1
+    assert unrooted.attacks[0].target_piece.kind is PieceType.ROOK
+    assert unrooted.attacks[0].attacker_value == 9
+    assert unrooted.attacks[0].target_value == 9
+    assert unrooted.attacks[0].rooted is False
+    assert rooted.attacks[0].rooted is True
