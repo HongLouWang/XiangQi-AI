@@ -307,9 +307,9 @@ def test_runtime_api_tracks_new_game_and_import_controllers(
 
     runtime = DesktopRuntime(api_enabled=True, server_factory=server_factory)
     qtbot.addWidget(runtime.window)
-    client = __import__(
-        "fastapi.testclient", fromlist=["TestClient"]
-    ).TestClient(created["app"])
+    client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(
+        created["app"]
+    )
 
     runtime.window.new_game(ruleset=Ruleset.ASIAN_2003)
 

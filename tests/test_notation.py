@@ -18,9 +18,7 @@ def _move(board: Board, start: Coord, end: Coord) -> Move:
         (Coord(1, 0), Coord(2, 2), "马８进７"),
     ],
 )
-def test_format_chinese_notation(
-    start: Coord, end: Coord, expected: str
-) -> None:
+def test_format_chinese_notation(start: Coord, end: Coord, expected: str) -> None:
     board = Board.standard()
     assert format_move(board, _move(board, start, end)) == expected
 
@@ -89,8 +87,7 @@ def test_four_or_five_same_file_pawns_format_and_replay_exactly(
         board = board.place(Coord(0, rank), pawn)
 
     destinations = tuple(
-        Coord(1, rank) if rank <= 4 else Coord(0, rank - 1)
-        for rank in ranks
+        Coord(1, rank) if rank <= 4 else Coord(0, rank - 1) for rank in ranks
     )
     actual = tuple(
         format_move(board, _move(board, Coord(0, rank), destination))

@@ -13,7 +13,6 @@ from xiangqi.domain import (
     PositionResult,
 )
 
-
 _ORTHOGONAL_DIRECTIONS = ((0, -1), (1, 0), (0, 1), (-1, 0))
 _HORSE_STEPS = (
     (-2, -1),
@@ -70,9 +69,7 @@ def _horse_destinations(board: Board, start: Coord) -> Iterator[Coord]:
             yield destination
 
 
-def _elephant_destinations(
-    board: Board, start: Coord, piece: Piece
-) -> Iterator[Coord]:
+def _elephant_destinations(board: Board, start: Coord, piece: Piece) -> Iterator[Coord]:
     for file_direction, rank_direction in _DIAGONALS:
         destination = _coord_if_in_bounds(
             start.file + 2 * file_direction,
@@ -90,7 +87,7 @@ def _elephant_destinations(
 
 
 def _palace_contains(color: Color, coord: Coord) -> bool:
-    ranks = range(7, 10) if color is Color.RED else range(0, 3)
+    ranks = range(7, 10) if color is Color.RED else range(3)
     return 3 <= coord.file <= 5 and coord.rank in ranks
 
 
@@ -138,9 +135,7 @@ def _pawn_destinations(start: Coord, piece: Piece) -> Iterator[Coord]:
     if destination is not None:
         yield destination
 
-    crossed_river = (
-        start.rank <= 4 if piece.color is Color.RED else start.rank >= 5
-    )
+    crossed_river = start.rank <= 4 if piece.color is Color.RED else start.rank >= 5
     if crossed_river:
         for file_step in (-1, 1):
             destination = _coord_if_in_bounds(start.file + file_step, start.rank)
@@ -212,14 +207,12 @@ def is_square_attacked(board: Board, square: Coord, by_color: Color) -> bool:
         if square in pseudo_legal_destinations(board, start):
             return True
 
-    if (
+    return (
         target is not None
         and target.kind is PieceType.GENERAL
         and target.color is by_color.opponent
         and _generals_face(board)
-    ):
-        return True
-    return False
+    )
 
 
 def is_in_check(board: Board, color: Color) -> bool:

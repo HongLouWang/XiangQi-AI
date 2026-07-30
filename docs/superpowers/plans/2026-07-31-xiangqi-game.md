@@ -137,7 +137,9 @@ class Move:
             "start": [self.start.file, self.start.rank],
             "end": [self.end.file, self.end.rank],
             "piece": {"color": self.piece.color, "kind": self.piece.kind},
-            "captured": None if self.captured is None else {
+            "captured": None
+            if self.captured is None
+            else {
                 "color": self.captured.color,
                 "kind": self.captured.kind,
             },
@@ -426,7 +428,10 @@ def test_invalid_import_does_not_replace_current_record(tmp_path) -> None:
     ],
 )
 def test_format_chinese_notation(start, end, expected) -> None:
-    assert format_move(Board.standard(), Move.from_board(Board.standard(), start, end)) == expected
+    assert (
+        format_move(Board.standard(), Move.from_board(Board.standard(), start, end))
+        == expected
+    )
 
 
 def test_parse_text_reports_exact_line_for_illegal_move() -> None:
@@ -493,7 +498,9 @@ def test_draw_requires_other_side_and_rejection_resumes() -> None:
 
 def test_callback_error_does_not_rollback_move() -> None:
     controller = GameController.new()
-    controller.register_callback(lambda event: (_ for _ in ()).throw(RuntimeError("boom")))
+    controller.register_callback(
+        lambda event: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
     controller.make_move(Coord(0, 6), Coord(0, 5))
     assert controller.state.ply == 1
     assert len(controller.callback_errors) == 1
@@ -536,15 +543,20 @@ git commit -m "功能：实现统一对局控制器"
 
 ```python
 def test_http_move_requires_matching_version_and_control(test_client) -> None:
-    claim = test_client.post("/v1/control/red/claim", json={"controller_id": "bot"}).json()
-    stale = test_client.post("/v1/moves", json={
-        "request_id": "r1",
-        "controller_id": "bot",
-        "token": claim["token"],
-        "expected_version": 999,
-        "from": [0, 6],
-        "to": [0, 5],
-    })
+    claim = test_client.post(
+        "/v1/control/red/claim", json={"controller_id": "bot"}
+    ).json()
+    stale = test_client.post(
+        "/v1/moves",
+        json={
+            "request_id": "r1",
+            "controller_id": "bot",
+            "token": claim["token"],
+            "expected_version": 999,
+            "from": [0, 6],
+            "to": [0, 5],
+        },
+    )
     assert stale.status_code == 409
     assert stale.json()["code"] == "stale_position"
 ```
@@ -594,10 +606,14 @@ git commit -m "功能：提供本机HTTP与WebSocket接口"
 - [ ] **Step 1: 写 Qt 交互失败测试**
 
 ```python
-def test_left_click_selects_piece_and_shows_all_legal_targets(qtbot, controller) -> None:
+def test_left_click_selects_piece_and_shows_all_legal_targets(
+    qtbot, controller
+) -> None:
     widget = BoardWidget(controller)
     qtbot.addWidget(widget)
-    qtbot.mouseClick(widget, Qt.MouseButton.LeftButton, pos=widget.point_for(Coord(0, 6)))
+    qtbot.mouseClick(
+        widget, Qt.MouseButton.LeftButton, pos=widget.point_for(Coord(0, 6))
+    )
     assert widget.selected == Coord(0, 6)
     assert widget.legal_targets == {Coord(0, 5)}
 

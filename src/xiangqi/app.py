@@ -68,9 +68,7 @@ class DesktopRuntime:
         self.controller_hub = ControllerHub(GameController.new())
         self.window = MainWindow(self.controller_hub.current)
         self.window.controller_replaced.connect(self.controller_hub.replace)
-        self.controller_hub.subscribe(
-            self.window.external_controller_replacement.emit
-        )
+        self.controller_hub.subscribe(self.window.external_controller_replacement.emit)
         self.api_thread: ApiServerThread | None = None
         self._shutting_down = False
         if api_enabled:

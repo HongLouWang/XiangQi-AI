@@ -168,8 +168,7 @@ class GameRecord(_RecordModel):
             accepted = event.action == "accept"
             pending = None
         negotiated = (
-            self.result.status == "draw"
-            and self.result.reason == "双方同意和棋"
+            self.result.status == "draw" and self.result.reason == "双方同意和棋"
         )
         if negotiated != accepted:
             raise ValueError("协商和棋必须保存双方依次提议和同意的事件")

@@ -170,13 +170,9 @@ def _adjudication(value: Any) -> dict[str, Any] | None:
         "ruleset": value.ruleset.value,
         "cycle_start": value.cycle_start,
         "reason": value.reason,
-        "responsible": (
-            None if value.responsible is None else value.responsible.value
-        ),
+        "responsible": (None if value.responsible is None else value.responsible.value),
         "move_natures": [nature.value for nature in value.move_natures],
-        "responsible_natures": [
-            nature.value for nature in value.responsible_natures
-        ],
+        "responsible_natures": [nature.value for nature in value.responsible_natures],
         "rule_reference": value.rule_reference,
     }
 
@@ -203,9 +199,7 @@ def _state(state: ControllerState) -> dict[str, Any]:
             "kind": state.position.kind.value,
             "side_to_move": state.position.side_to_move.value,
             "winner": (
-                None
-                if state.position.winner is None
-                else state.position.winner.value
+                None if state.position.winner is None else state.position.winner.value
             ),
             "in_check": state.position.in_check,
         },
@@ -214,9 +208,7 @@ def _state(state: ControllerState) -> dict[str, Any]:
             None if state.pending_draw is None else state.pending_draw.value
         ),
         "replay_cursor": state.replay_cursor,
-        "last_move": (
-            None if state.last_move is None else state.last_move.to_dict()
-        ),
+        "last_move": (None if state.last_move is None else state.last_move.to_dict()),
         "adjudication": _adjudication(state.adjudication),
         "controllers": {
             side.value: {
@@ -270,9 +262,7 @@ def _error(code: str, message: str, details: Any = None) -> dict[str, Any]:
 def _verify_version(controller: GameController, expected: int) -> None:
     current = controller.get_state().version
     if expected != current:
-        raise StaleVersionError(
-            f"局面版本已变化: 预期 {expected}，当前 {current}"
-        )
+        raise StaleVersionError(f"局面版本已变化: 预期 {expected}，当前 {current}")
 
 
 def _claim_side(
@@ -300,38 +290,24 @@ def _release_side(
         command.token or "",
         expected_version=command.expected_version,
     )
-    return _success(
-        controller, event=event, request_id=command.request_id
-    )
+    return _success(controller, event=event, request_id=command.request_id)
 
 
-def _move(
-    controller: GameController, command: MoveCommand
-) -> dict[str, Any]:
-    _authorize_identity(
-        controller, command, controller.get_state().side_to_move
-    )
+def _move(controller: GameController, command: MoveCommand) -> dict[str, Any]:
+    _authorize_identity(controller, command, controller.get_state().side_to_move)
     event = controller.make_move(
         _coord(command.start),
         _coord(command.end),
         actor=command.token,
         expected_version=command.expected_version,
     )
-    return _success(
-        controller, event=event, request_id=command.request_id
-    )
+    return _success(controller, event=event, request_id=command.request_id)
 
 
-def _undo(
-    controller: GameController, command: UndoCommand
-) -> dict[str, Any]:
+def _undo(controller: GameController, command: UndoCommand) -> dict[str, Any]:
     _authorize_identity(controller, command)
-    event = controller.undo(
-        command.steps, expected_version=command.expected_version
-    )
-    return _success(
-        controller, event=event, request_id=command.request_id
-    )
+    event = controller.undo(command.steps, expected_version=command.expected_version)
+    return _success(controller, event=event, request_id=command.request_id)
 
 
 def _offer_draw(
@@ -343,9 +319,7 @@ def _offer_draw(
         control_token=command.token,
         expected_version=command.expected_version,
     )
-    return _success(
-        controller, event=event, request_id=command.request_id
-    )
+    return _success(controller, event=event, request_id=command.request_id)
 
 
 def _respond_draw(
@@ -358,9 +332,7 @@ def _respond_draw(
         control_token=command.token,
         expected_version=command.expected_version,
     )
-    return _success(
-        controller, event=event, request_id=command.request_id
-    )
+    return _success(controller, event=event, request_id=command.request_id)
 
 
 def _export_record(
@@ -369,9 +341,7 @@ def _export_record(
     _authorize_identity(controller, command)
     _verify_version(controller, command.expected_version)
     controller.export_record(command.path, command.format)
-    return _success(
-        controller, request_id=command.request_id, path=command.path
-    )
+    return _success(controller, request_id=command.request_id, path=command.path)
 
 
 def _authorize_identity(
@@ -380,13 +350,9 @@ def _authorize_identity(
     side: Color | None = None,
 ) -> None:
     controls = controller.get_state().controllers
-    candidates = (
-        (controls[side],) if side is not None else tuple(controls.values())
-    )
+    candidates = (controls[side],) if side is not None else tuple(controls.values())
     external = [
-        control
-        for control in candidates
-        if control.kind is not ControllerKind.HUMAN
+        control for control in candidates if control.kind is not ControllerKind.HUMAN
     ]
     if not external:
         raise ControlError("网络客户端尚未取得控制权")
@@ -425,9 +391,7 @@ def create_api(
         key = (command.controller_id, command.request_id)
         with request_lock:
             if key in processed_requests:
-                raise ControlError(
-                    f"重复 request_id: {command.request_id}"
-                )
+                raise ControlError(f"重复 request_id: {command.request_id}")
             processed_requests.add(key)
         return action()
 
@@ -437,9 +401,7 @@ def create_api(
             event = controller.load_record(
                 command.path, expected_version=command.expected_version
             )
-            return _success(
-                controller, event=event, request_id=command.request_id
-            )
+            return _success(controller, event=event, request_id=command.request_id)
         _verify_version(controller, command.expected_version)
         text = Path(command.path).read_text(encoding="utf-8")
         replayed = replay_text(text)
@@ -471,25 +433,19 @@ def create_api(
         )
 
     @app.exception_handler(StaleVersionError)
-    async def stale_error(
-        _request: Request, error: StaleVersionError
-    ) -> JSONResponse:
+    async def stale_error(_request: Request, error: StaleVersionError) -> JSONResponse:
         return JSONResponse(
             status_code=409,
             content=_error("stale_version", str(error)),
         )
 
     @app.exception_handler(ControlError)
-    async def control_error(
-        _request: Request, error: ControlError
-    ) -> JSONResponse:
+    async def control_error(_request: Request, error: ControlError) -> JSONResponse:
         message = str(error)
         illegal = "非法着法" in message or "坐标越界" in message
         return JSONResponse(
             status_code=422 if illegal else 409,
-            content=_error(
-                "invalid_command" if illegal else "control_error", message
-            ),
+            content=_error("invalid_command" if illegal else "control_error", message),
         )
 
     @app.exception_handler(RequestValidationError)
@@ -513,9 +469,7 @@ def create_api(
         )
 
     @app.exception_handler(ValueError)
-    async def value_error(
-        _request: Request, error: ValueError
-    ) -> JSONResponse:
+    async def value_error(_request: Request, error: ValueError) -> JSONResponse:
         return JSONResponse(
             status_code=422,
             content=_error("invalid_command", str(error)),
@@ -612,6 +566,7 @@ def create_api(
         if model is None:
             raise ControlError(f"不支持的 WebSocket 命令: {command_name}")
         command = model.model_validate(raw)
+
         def dispatch() -> dict[str, Any]:
             if isinstance(command, SideControlCommand):
                 return (
@@ -654,9 +609,7 @@ def create_api(
         receive_task: asyncio.Task[dict[str, Any]] | None = asyncio.create_task(
             websocket.receive_json()
         )
-        event_task: asyncio.Task[Any] | None = asyncio.create_task(
-            next_event(events)
-        )
+        event_task: asyncio.Task[Any] | None = asyncio.create_task(next_event(events))
         try:
             while True:
                 assert receive_task is not None and event_task is not None
@@ -705,17 +658,11 @@ def create_api(
                                 **_error("invalid_command", str(error)),
                             }
                         )
-                    receive_task = asyncio.create_task(
-                        websocket.receive_json()
-                    )
+                    receive_task = asyncio.create_task(websocket.receive_json())
                 if event_task in done:
                     event = event_task.result()
-                    await websocket.send_json(
-                        {"type": "event", "event": _event(event)}
-                    )
-                    event_task = asyncio.create_task(
-                        next_event(events)
-                    )
+                    await websocket.send_json({"type": "event", "event": _event(event)})
+                    event_task = asyncio.create_task(next_event(events))
         finally:
             broker.unsubscribe(events)
             for task in (receive_task, event_task):

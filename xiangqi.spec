@@ -1,9 +1,8 @@
 # ruff: noqa: F821
 """PyInstaller configuration for the macOS 中国象棋.app bundle."""
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_submodules
 
-pyside_datas, pyside_binaries, pyside_hidden = collect_all("PySide6")
 service_hidden = []
 for package in ("fastapi", "pydantic", "pydantic_core", "starlette", "uvicorn"):
     service_hidden += collect_submodules(package)
@@ -11,9 +10,9 @@ for package in ("fastapi", "pydantic", "pydantic_core", "starlette", "uvicorn"):
 analysis = Analysis(
     ["src/xiangqi/__main__.py"],
     pathex=["src"],
-    binaries=pyside_binaries,
-    datas=pyside_datas,
-    hiddenimports=pyside_hidden + service_hidden,
+    binaries=[],
+    datas=[],
+    hiddenimports=service_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

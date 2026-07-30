@@ -136,13 +136,13 @@ def replay_text(
             if format_move(board, move) == notation
         ]
         if not matches:
-            raise NotationError(f"第 {line_number} 行不是当前局面的合法着法: {notation}")
+            raise NotationError(
+                f"第 {line_number} 行不是当前局面的合法着法: {notation}"
+            )
         if len(matches) > 1:
             raise NotationError(f"第 {line_number} 行着法有歧义: {notation}")
         move = matches[0]
         board = board.move_unchecked(move.start, move.end)
         side = side.opponent
-        replayed.append(
-            NotatedMove(move, notation, board.position_key(side))
-        )
+        replayed.append(NotatedMove(move, notation, board.position_key(side)))
     return ReplayResult(board, side, tuple(replayed))

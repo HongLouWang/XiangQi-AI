@@ -115,9 +115,7 @@ def test_draw_undo_and_record_round_trip(tmp_path) -> None:
     controller = GameController.new()
     client = TestClient(create_api(controller))
 
-    red_token = client.post(
-        "/control/red/claim", json=_command()
-    ).json()["token"]
+    red_token = client.post("/control/red/claim", json=_command()).json()["token"]
     offered = client.post(
         "/draw/offer",
         json=_command(
@@ -320,9 +318,7 @@ def test_unclaimed_http_and_websocket_moves_are_rejected() -> None:
     controller = GameController.new()
     client = TestClient(create_api(controller))
 
-    denied = client.post(
-        "/move", json=_command(start=[0, 6], end=[0, 5])
-    )
+    denied = client.post("/move", json=_command(start=[0, 6], end=[0, 5]))
     assert denied.status_code == 409
     assert controller.get_state().ply == 0
 
@@ -440,9 +436,7 @@ def test_leased_identity_is_enforced_for_move_and_global_mutations(
 ) -> None:
     controller = GameController.new()
     client = TestClient(create_api(controller))
-    token = client.post(
-        "/control/red/claim", json=_command()
-    ).json()["token"]
+    token = client.post("/control/red/claim", json=_command()).json()["token"]
 
     wrong_identity = client.post(
         "/move",

@@ -49,9 +49,7 @@ class MainWindow(QMainWindow):
         self.controller = controller or GameController.new()
         self.replay_timer = QTimer(self)
         self.replay_timer.timeout.connect(self.replay_next)
-        self.external_controller_replacement.connect(
-            self._replace_controller
-        )
+        self.external_controller_replacement.connect(self._replace_controller)
 
         self.red_player_label = QLabel()
         self.black_player_label = QLabel()

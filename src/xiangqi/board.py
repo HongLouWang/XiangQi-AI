@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from types import MappingProxyType
-from typing import Mapping
 
 from xiangqi.domain import Color, Coord, Piece, PieceType
-
 
 _FEN_TO_PIECE_TYPE = {
     "k": PieceType.GENERAL,
