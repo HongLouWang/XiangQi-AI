@@ -86,9 +86,7 @@ def test_move_increments_version_and_rejects_stale_or_illegal_commands() -> None
     assert event.kind is GameEventKind.MOVE
     assert controller.get_state().version == 1
     with pytest.raises(StaleVersionError):
-        controller.make_move(
-            Coord(0, 3), Coord(0, 4), expected_version=before.version
-        )
+        controller.make_move(Coord(0, 3), Coord(0, 4), expected_version=before.version)
     unchanged = controller.get_state()
     with pytest.raises(ControlError, match="非法"):
         controller.make_move(Coord(0, 3), Coord(1, 3))
@@ -96,9 +94,7 @@ def test_move_increments_version_and_rejects_stale_or_illegal_commands() -> None
 
 
 def test_each_move_event_contains_transition_and_terminal_status() -> None:
-    controller = GameController.from_record(
-        _record(fen="4k4/4RR3/3R5/9/9/9/9/9/9/4K4")
-    )
+    controller = GameController.from_record(_record(fen="4k4/4RR3/3R5/9/9/9/9/9/9/4K4"))
 
     event = controller.make_move(Coord(3, 2), Coord(3, 1))
 
@@ -114,9 +110,7 @@ def test_each_move_event_contains_transition_and_terminal_status() -> None:
 
 
 def test_undo_is_unlimited_and_terminal_game_can_resume() -> None:
-    controller = GameController.from_record(
-        _record(fen="4k4/4RR3/3R5/9/9/9/9/9/9/4K4")
-    )
+    controller = GameController.from_record(_record(fen="4k4/4RR3/3R5/9/9/9/9/9/9/4K4"))
     controller.make_move(Coord(3, 2), Coord(3, 1))
     assert controller.get_state().result is not None
 
@@ -323,7 +317,7 @@ def test_import_rejects_incorrect_per_move_adjudication_metadata() -> None:
 
 
 @pytest.mark.parametrize("ruleset", list(Ruleset))
-def test_responsible_side_cannot_repeat_a_prohibited_long_check(
+def test_ignored_must_change_is_recorded_as_loss_and_undo_restores_obligation(
     ruleset: Ruleset,
 ) -> None:
     fen = "4k4/3R5/9/9/9/4P4/9/9/9/4K4"
@@ -337,24 +331,53 @@ def test_responsible_side_cannot_repeat_a_prohibited_long_check(
         _record(fen=fen, ruleset=ruleset, moves=cycle * 2)
     )
     assert controller.get_state().adjudication is not None
-    assert (
-        controller.get_state().adjudication.kind
-        is AdjudicationKind.MUST_CHANGE
-    )
+    assert controller.get_state().adjudication.kind is AdjudicationKind.MUST_CHANGE
 
-    before = controller.get_state()
-    with pytest.raises(ControlError, match="变着"):
-        controller.make_move(Coord(3, 1), Coord(4, 1))
+    event = controller.make_move(Coord(3, 1), Coord(4, 1))
 
-    assert controller.get_state() == before
+    state = controller.get_state()
+    assert event.adjudication is not None
+    assert event.adjudication.kind is AdjudicationKind.LOSS
+    assert event.result is not None
+    assert event.result.winner is Color.BLACK
+    assert state.result == event.result
+    assert state.ply == 9
+
+    undo_event = controller.undo()
+    restored = controller.get_state()
+    assert undo_event.kind is GameEventKind.UNDO
+    assert restored.result is None
+    assert restored.ply == 8
+    assert restored.adjudication is not None
+    assert restored.adjudication.kind is AdjudicationKind.MUST_CHANGE
+
+
+def test_controller_defers_kill_search_until_a_repetition_candidate(
+    monkeypatch,
+) -> None:
+    import xiangqi.adjudication as adjudication_module
+
+    calls = 0
+    original = adjudication_module._has_forced_mate_next_move
+
+    def counted(board, attacker):
+        nonlocal calls
+        calls += 1
+        return original(board, attacker)
+
+    monkeypatch.setattr(adjudication_module, "_has_forced_mate_next_move", counted)
+    controller = GameController.new()
+
+    controller.make_move(Coord(0, 6), Coord(0, 5))
+    controller.make_move(Coord(0, 3), Coord(0, 4))
+
+    assert calls == 0
 
 
 def test_imported_terminal_metadata_must_match_replayed_position() -> None:
     record = _record(moves=((Coord(0, 6), Coord(0, 5)),)).model_copy(
         update={
-            "result": ResultRecord(
-                status="red_win", reason="伪造", winner=Color.RED
-            )
+            "result": ResultRecord(status="red_win", reason="伪造", winner=Color.RED)
         }
     )
 
@@ -377,10 +400,7 @@ def test_draw_offer_reject_and_accept_are_persisted() -> None:
     controller.offer_draw(Color.BLACK)
     controller.respond_draw(Color.RED, True)
 
-    assert [
-        (event.action, event.actor)
-        for event in controller.record.draw_events
-    ] == [
+    assert [(event.action, event.actor) for event in controller.record.draw_events] == [
         ("offer", Color.RED),
         ("reject", Color.BLACK),
         ("offer", Color.BLACK),

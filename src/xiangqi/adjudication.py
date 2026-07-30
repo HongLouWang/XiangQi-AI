@@ -163,6 +163,8 @@ class PositionFrame:
         side: Color,
         move: Move,
         board_after: Board,
+        *,
+        analyze_kill: bool = True,
     ) -> PositionFrame:
         """Build and validate a frame from a real board transition."""
         if move.piece.color is not side:
@@ -180,7 +182,7 @@ class PositionFrame:
         attacks = _new_attacks(board_before, board_after, side, move)
         if is_in_check(board_after, side.opponent):
             nature = MoveNature.CHECK
-        elif _has_forced_mate_next_move(board_after, side):
+        elif analyze_kill and _has_forced_mate_next_move(board_after, side):
             nature = MoveNature.KILL
         elif any(
             attack.attacker_piece.kind not in (PieceType.GENERAL, PieceType.PAWN)
@@ -261,6 +263,7 @@ def _validate_history(history: Sequence[PositionFrame]) -> None:
             frame.side,
             frame.move,
             frame.board_after,
+            analyze_kill=frame.nature is MoveNature.KILL,
         )
         if (
             frame.before_key != rebuilt.before_key
@@ -280,6 +283,32 @@ def _validate_history(history: Sequence[PositionFrame]) -> None:
 def _natures_by_side(cycle: _Cycle) -> dict[Color, tuple[MoveNature, ...]]:
     return {
         color: tuple(frame.nature for frame in cycle.frames if frame.side is color)
+        for color in Color
+    }
+
+
+def _effective_cycle_natures(cycle: _Cycle) -> tuple[MoveNature, ...]:
+    """Complete expensive kill classification only for an actual cycle."""
+    return tuple(
+        (
+            MoveNature.KILL
+            if frame.nature is MoveNature.IDLE
+            and _has_forced_mate_next_move(frame.board_after, frame.side)
+            else frame.nature
+        )
+        for frame in cycle.frames
+    )
+
+
+def _effective_natures_by_side(
+    cycle: _Cycle, effective: Sequence[MoveNature]
+) -> dict[Color, tuple[MoveNature, ...]]:
+    return {
+        color: tuple(
+            nature
+            for frame, nature in zip(cycle.frames, effective, strict=True)
+            if frame.side is color
+        )
         for color in Color
     }
 
@@ -468,12 +497,13 @@ class Chinese2020Adjudicator(_AdjudicatorBase):
         return self._evaluate_cycle(cycle)
 
     def _evaluate_cycle(self, cycle: _Cycle) -> Adjudication:
+        effective = _effective_cycle_natures(cycle)
         return _evaluate_responsibility(
-            _natures_by_side(cycle),
+            _effective_natures_by_side(cycle, effective),
             self.ruleset,
             self._reference,
             cycle.start,
-            tuple(frame.nature for frame in cycle.frames),
+            effective,
         )
 
 
@@ -489,10 +519,11 @@ class Asian2003Adjudicator(_AdjudicatorBase):
         return self._evaluate_cycle(cycle)
 
     def _evaluate_cycle(self, cycle: _Cycle) -> Adjudication:
+        effective = _effective_cycle_natures(cycle)
         return _evaluate_responsibility(
-            _natures_by_side(cycle),
+            _effective_natures_by_side(cycle, effective),
             self.ruleset,
             self._reference,
             cycle.start,
-            tuple(frame.nature for frame in cycle.frames),
+            effective,
         )

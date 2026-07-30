@@ -144,17 +144,14 @@ class GameController:
         self._version = 0
         self._pending_draw: Color | None = (
             validated.draw_events[-1].actor
-            if validated.draw_events
-            and validated.draw_events[-1].action == "offer"
+            if validated.draw_events and validated.draw_events[-1].action == "offer"
             else None
         )
         self._replay_cursor: int | None = None
         self._base_record = validated.model_copy(
             update={"result": ResultRecord(status="ongoing")}
         )
-        self._current = self._replay(
-            self._base_record, len(self._base_record.moves)
-        )
+        self._current = self._replay(self._base_record, len(self._base_record.moves))
         imported_result = validated.result
         if imported_result.status == "draw" and self._current.result is None:
             self._current = _ReplayState(
@@ -233,9 +230,7 @@ class GameController:
                 result=displayed.result,
                 pending_draw=self._pending_draw,
                 replay_cursor=self._replay_cursor,
-                last_move=(
-                    None if not displayed.frames else displayed.frames[-1].move
-                ),
+                last_move=(None if not displayed.frames else displayed.frames[-1].move),
                 adjudication=displayed.adjudication,
                 controllers=self._controls,
             )
@@ -249,9 +244,7 @@ class GameController:
             grouped: dict[Coord, tuple[Coord, ...]] = {}
             for coord, piece in state.board.pieces.items():
                 if piece.color is requested:
-                    destinations = legal_destinations(
-                        state.board, coord, requested
-                    )
+                    destinations = legal_destinations(state.board, coord, requested)
                     if destinations:
                         grouped[coord] = destinations
             return MappingProxyType(grouped)
@@ -285,24 +278,31 @@ class GameController:
             notation = format_move(before, move)
             after = before.move_unchecked(from_pos, to_pos)
             next_side = self._current.side.opponent
-            frame = PositionFrame.from_transition(before, self._current.side, move, after)
+            frame = PositionFrame.from_transition(
+                before,
+                self._current.side,
+                move,
+                after,
+                analyze_kill=False,
+            )
             frames = (*self._current.frames, frame)
             position = evaluate_position(after, next_side)
-            adjudication = self._adjudicator().evaluate(frames)
-            if self._repeats_prohibited_cycle(frame):
-                raise ControlError(
-                    f"{self._current.side.value} 方须变着，不能继续"
-                    f"{self._current.adjudication.reason}"
-                )
+            adjudicator = self._adjudicator()
+            adjudication = adjudicator.evaluate(frames)
+            if self._continues_prohibited_cycle(
+                self._current.frames,
+                self._current.adjudication,
+                frame,
+                adjudication,
+            ):
+                adjudication = adjudicator.loss_for_ignored_must_change(adjudication)
             result = self._result_for(position, adjudication)
             item = MoveRecord.from_move(
                 move,
                 notation=notation,
                 position_after=after.position_key(next_side),
                 in_check=position.in_check,
-                adjudication=self._adjudication_record(
-                    adjudication, len(frames)
-                ),
+                adjudication=self._adjudication_record(adjudication, len(frames)),
             )
             self._current = _ReplayState(
                 board=after,
@@ -347,9 +347,7 @@ class GameController:
             self._current = self._replay(self._base_record, count)
             self._pending_draw = None
             self._replay_cursor = None
-            return self._finish_event(
-                GameEventKind.UNDO, before_board=before
-            )
+            return self._finish_event(GameEventKind.UNDO, before_board=before)
 
     def offer_draw(
         self,
@@ -379,9 +377,7 @@ class GameController:
                     )
                 }
             )
-            return self._finish_event(
-                GameEventKind.DRAW_OFFERED, before_board=before
-            )
+            return self._finish_event(GameEventKind.DRAW_OFFERED, before_board=before)
 
     def respond_draw(
         self,
@@ -424,9 +420,7 @@ class GameController:
                     result=ResultRecord(status="draw", reason="双方同意和棋"),
                 )
                 self._base_record = self._record_from_current()
-            return self._finish_event(
-                GameEventKind.DRAW_RESPONDED, before_board=before
-            )
+            return self._finish_event(GameEventKind.DRAW_RESPONDED, before_board=before)
 
     def register_callback(self, callback: Callback) -> None:
         if not callable(callback):
@@ -492,14 +486,10 @@ class GameController:
                 raise ControlError("回放游标超出棋谱范围")
             before = self.get_state().board
             self._replay_cursor = ply
-            self._finish_event(
-                GameEventKind.REPLAY_CHANGED, before_board=before
-            )
+            self._finish_event(GameEventKind.REPLAY_CHANGED, before_board=before)
             return self.get_state()
 
-    def branch_from_replay(
-        self, *, expected_version: int | None = None
-    ) -> GameEvent:
+    def branch_from_replay(self, *, expected_version: int | None = None) -> GameEvent:
         with self._lock:
             self._check_version(expected_version)
             if self._replay_cursor is None:
@@ -516,9 +506,7 @@ class GameController:
             self._current = self._replay(self._base_record, count)
             self._replay_cursor = None
             self._pending_draw = None
-            return self._finish_event(
-                GameEventKind.BRANCHED, before_board=before
-            )
+            return self._finish_event(GameEventKind.BRANCHED, before_board=before)
 
     def load_record(
         self,
@@ -535,13 +523,9 @@ class GameController:
             self._current = replacement._current
             self._pending_draw = replacement._pending_draw
             self._replay_cursor = None
-            return self._finish_event(
-                GameEventKind.RECORD_LOADED, before_board=before
-            )
+            return self._finish_event(GameEventKind.RECORD_LOADED, before_board=before)
 
-    def export_record(
-        self, path: str | os.PathLike[str], format: str = "json"
-    ) -> None:
+    def export_record(self, path: str | os.PathLike[str], format: str = "json") -> None:
         record = self.record
         if format == "json":
             export_json(record, path)
@@ -591,18 +575,24 @@ class GameController:
             return Chinese2020Adjudicator()
         return Asian2003Adjudicator()
 
-    def _repeats_prohibited_cycle(self, candidate: PositionFrame) -> bool:
-        decision = self._current.adjudication
+    @staticmethod
+    def _continues_prohibited_cycle(
+        prior_frames: tuple[PositionFrame, ...],
+        decision: Adjudication | None,
+        candidate: PositionFrame,
+        candidate_decision: Adjudication,
+    ) -> bool:
         if (
             decision is None
             or decision.kind is not AdjudicationKind.MUST_CHANGE
             or decision.responsible is not candidate.side
-            or candidate.nature not in decision.responsible_natures
+            or candidate_decision.kind is not AdjudicationKind.MUST_CHANGE
+            or candidate_decision.responsible is not decision.responsible
         ):
             return False
         prior_keys = [
-            self._current.frames[0].before_key,
-            *(frame.after_key for frame in self._current.frames),
+            prior_frames[0].before_key,
+            *(frame.after_key for frame in prior_frames),
         ]
         return prior_keys.count(candidate.after_key) >= 2
 
@@ -611,20 +601,30 @@ class GameController:
         side = record.initial_side
         frames: list[PositionFrame] = []
         normalized: list[MoveRecord] = []
+        prior_adjudication: Adjudication | None = None
         records = record.moves if count is None else record.moves[:count]
         for index, item in enumerate(records, 1):
             move = item.to_move()
             after = board.move_unchecked(move.start, move.end)
-            frames.append(PositionFrame.from_transition(board, side, move, after))
+            frame = PositionFrame.from_transition(
+                board, side, move, after, analyze_kill=False
+            )
+            frames.append(frame)
             board = after
             side = side.opponent
             position = evaluate_position(board, side)
-            adjudication = self._adjudicator().evaluate(frames)
+            adjudicator = self._adjudicator()
+            adjudication = adjudicator.evaluate(frames)
+            if self._continues_prohibited_cycle(
+                tuple(frames[:-1]),
+                prior_adjudication,
+                frame,
+                adjudication,
+            ):
+                adjudication = adjudicator.loss_for_ignored_must_change(adjudication)
             if item.in_check != position.in_check:
                 raise ControlError(f"第 {index} 步将军标记与重放局面不一致")
-            expected_adjudication = self._adjudication_record(
-                adjudication, len(frames)
-            )
+            expected_adjudication = self._adjudication_record(adjudication, len(frames))
             if (
                 item.adjudication is not None
                 and item.adjudication != expected_adjudication
@@ -639,8 +639,13 @@ class GameController:
                     adjudication=expected_adjudication,
                 )
             )
+            prior_adjudication = adjudication
         position = evaluate_position(board, side)
-        adjudication = self._adjudicator().evaluate(frames)
+        adjudication = (
+            prior_adjudication
+            if prior_adjudication is not None
+            else self._adjudicator().evaluate(frames)
+        )
         result = self._result_for(position, adjudication)
         return _ReplayState(
             board,
@@ -659,16 +664,8 @@ class GameController:
         if position.kind in (PositionKind.CHECKMATE, PositionKind.STALEMATE):
             assert position.winner is not None
             return ResultRecord(
-                status=(
-                    "red_win"
-                    if position.winner is Color.RED
-                    else "black_win"
-                ),
-                reason=(
-                    "将死"
-                    if position.kind is PositionKind.CHECKMATE
-                    else "困毙"
-                ),
+                status=("red_win" if position.winner is Color.RED else "black_win"),
+                reason=("将死" if position.kind is PositionKind.CHECKMATE else "困毙"),
                 winner=position.winner,
             )
         if adjudication.kind is AdjudicationKind.DRAW:
@@ -689,19 +686,12 @@ class GameController:
         return self._base_record.model_copy(
             update={
                 "moves": self._current.records,
-                "result": self._current.result
-                or ResultRecord(status="ongoing"),
+                "result": self._current.result or ResultRecord(status="ongoing"),
             }
         )
 
-    def _draw_events_for_resume(
-        self, ply: int
-    ) -> tuple[DrawEventRecord, ...]:
-        events = [
-            event
-            for event in self._base_record.draw_events
-            if event.ply <= ply
-        ]
+    def _draw_events_for_resume(self, ply: int) -> tuple[DrawEventRecord, ...]:
+        events = [event for event in self._base_record.draw_events if event.ply <= ply]
         if events and events[-1].action == "accept":
             events = events[:-2]
         elif events and events[-1].action == "offer":
@@ -756,7 +746,5 @@ class GameController:
             try:
                 callback(event)
             except Exception as error:  # noqa: BLE001 - extension failures are isolated
-                self._callback_errors.append(
-                    CallbackFailure(callback, event, error)
-                )
+                self._callback_errors.append(CallbackFailure(callback, event, error))
         return event
