@@ -6,7 +6,7 @@
 
 **Architecture:** 纯 Python 规则引擎生成不可歧义的局面与着法，由 `GameController` 统一承接 UI、同进程程序和网络命令。PySide6 只负责交互和显示，FastAPI 只负责协议适配，JSON/中文棋谱和中国/亚洲棋例分别通过独立策略模块接入。
 
-**Tech Stack:** Python 3.11+、PySide6、FastAPI、Uvicorn、Pydantic 2、pytest、pytest-qt、httpx、Ruff
+**Tech Stack:** Python 3.11+、PySide6、FastAPI、Uvicorn、Pydantic 2、pytest、pytest-qt、httpx、Ruff、PyInstaller（macOS `.app`）
 
 ---
 
@@ -15,6 +15,7 @@
 ```text
 pyproject.toml                         项目元数据、依赖与工具配置
 README.md                              安装、启动、Python/API 使用说明
+xiangqi.spec                           macOS `.app` 的 PyInstaller 构建配置
 src/xiangqi/__init__.py                包版本与公共入口
 src/xiangqi/__main__.py                `python -m xiangqi` 启动入口
 src/xiangqi/domain.py                  棋子、坐标、着法、状态、事件值对象
@@ -84,7 +85,8 @@ Expected: FAIL，包含 `ModuleNotFoundError: No module named 'xiangqi'`
 
 `pyproject.toml` 定义 src-layout 包、Python `>=3.11`，运行依赖
 `PySide6>=6.7`、`fastapi>=0.115`、`uvicorn>=0.30`、`pydantic>=2.8`，
-开发依赖 `pytest>=8.2`、`pytest-qt>=4.4`、`httpx>=0.27`、`ruff>=0.6`。
+开发依赖 `pytest>=8.2`、`pytest-qt>=4.4`、`httpx>=0.27`、`ruff>=0.6`、
+`pyinstaller>=6.10`。
 `domain.py` 使用冻结 dataclass 和字符串枚举定义：
 
 ```python
@@ -697,6 +699,7 @@ git commit -m "界面：完成主窗口与棋谱回放"
 - Create: `src/xiangqi/app.py`
 - Create: `src/xiangqi/__main__.py`
 - Modify: `src/xiangqi/__init__.py`
+- Create: `xiangqi.spec`
 - Create: `README.md`
 - Modify: `tests/ui/test_main_window.py`
 
@@ -720,14 +723,22 @@ Expected: FAIL，缺少应用生命周期实现
 `app.py` 创建一个控制器，在 `QThread` 中启动 uvicorn，强制 host 为
 `127.0.0.1`。窗口关闭信号设置 `server.should_exit = True` 并等待线程；
 `__main__.py` 调用 `raise SystemExit(run())`。命令行只允许配置端口和关闭 API，
-不允许配置非本机 host。
+不允许配置非本机 host。实现不得使用 Windows/Linux 专用 API。
 
-- [ ] **Step 4: 编写 README**
+- [ ] **Step 4: 创建 macOS 应用构建配置**
+
+`xiangqi.spec` 使用 `BUNDLE` 生成名为“中国象棋”的窗口应用，收集 PySide6
+平台插件、FastAPI/Pydantic/Uvicorn 隐式导入，并把 bundle identifier 设置为
+`com.xiangqi.desktop`。应用入口为 `src/xiangqi/__main__.py`，控制台窗口关闭。
+
+- [ ] **Step 5: 编写 README**
 
 给出虚拟环境安装、`python -m xiangqi` 启动、规则模式说明、JSON/中文棋谱、
 Python callback/控制示例、HTTP/WebSocket 示例、默认本机安全边界和测试命令。
+另给出 `python -m PyInstaller --clean --noconfirm xiangqi.spec` 和从 Finder
+启动 `dist/中国象棋.app` 的 macOS 步骤。
 
-- [ ] **Step 5: 运行生命周期测试和启动冒烟测试**
+- [ ] **Step 6: 运行生命周期测试和启动冒烟测试**
 
 Run: `QT_QPA_PLATFORM=offscreen python -m pytest tests/ui/test_main_window.py -v`
 Expected: 全部 PASS
@@ -759,11 +770,11 @@ PY
 
 Expected: 进程持续运行 5 秒且 stderr 中没有 traceback
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 7: 提交**
 
 ```bash
-git add src/xiangqi/app.py src/xiangqi/__main__.py src/xiangqi/__init__.py README.md tests/ui/test_main_window.py
-git commit -m "功能：完成应用启动与使用文档"
+git add src/xiangqi/app.py src/xiangqi/__main__.py src/xiangqi/__init__.py xiangqi.spec README.md tests/ui/test_main_window.py
+git commit -m "功能：完成macOS应用启动与使用文档"
 ```
 
 ### Task 12: 全量验证与实际窗口验收
@@ -789,16 +800,25 @@ Expected: 所有文件已格式化
 Run: `python -m build`
 Expected: 生成 wheel 和 sdist，命令退出码 0
 
-- [ ] **Step 4: 实际窗口人工验收**
+- [ ] **Step 4: 构建并启动 macOS 应用包**
+
+Run: `python -m PyInstaller --clean --noconfirm xiangqi.spec`
+Expected: 生成 `dist/中国象棋.app`，命令退出码 0
+
+Run: `open "dist/中国象棋.app"`
+Expected: macOS 显示中国象棋主窗口，能够完成一步走棋并正常退出
+
+- [ ] **Step 5: 实际窗口人工验收**
 
 Run: `python -m xiangqi`
 
 依次验证：创建中国棋规新局；左键选子与全部合法落点；红黑各走一步后确认
 对方最后棋子持续高亮；连续悔棋到开局；提和拒绝和同意；JSON 与中文棋谱各
 导出、导入；播放回放并从中间继续；终局后悔棋；Python callback；HTTP 控制
-红方、WebSocket 观察事件。记录每项结果。
+红方、WebSocket 观察事件。记录每项结果。上述流程必须在 macOS 实际窗口中
+执行，不以 offscreen 测试代替。
 
-- [ ] **Step 5: 检查最终工作树和需求覆盖**
+- [ ] **Step 6: 检查最终工作树和需求覆盖**
 
 Run: `git status --short`
 Expected: 仅出现验收修复或无输出
@@ -807,7 +827,7 @@ Expected: 仅出现验收修复或无输出
 `docs/superpowers/specs/2026-07-31-xiangqi-game-design.md`，为每一项要求指出
 自动化测试或人工验收证据；任何缺少证据的要求都补测或补验。
 
-- [ ] **Step 6: 提交验收修复**
+- [ ] **Step 7: 提交验收修复**
 
 仅在验证产生代码变更时执行：
 
