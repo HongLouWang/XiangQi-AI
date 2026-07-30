@@ -34,6 +34,7 @@ class MainWindow(QMainWindow):
     """Game controls, player summary, moves and non-destructive replay."""
 
     controller_changed = Signal()
+    closing = Signal()
 
     def __init__(
         self,
@@ -332,4 +333,5 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.stop_replay()
+        self.closing.emit()
         super().closeEvent(event)

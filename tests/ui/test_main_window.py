@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
 
 import pytest
 from PySide6.QtCore import Qt
 
 from xiangqi.adjudication import Ruleset
+from xiangqi.app import DesktopRuntime
 from xiangqi.controller import ControllerKind, GameController
 from xiangqi.domain import Color, Coord
 from xiangqi.record import PlayerRecord
@@ -243,3 +245,46 @@ def test_close_stops_replay_timer(window: MainWindow) -> None:
     assert window.replay_timer.isActive()
     window.close()
     assert not window.replay_timer.isActive()
+
+
+def test_close_stops_replay_and_local_api_thread(qtbot) -> None:
+    created: dict[str, object] = {}
+
+    class FakeServer:
+        should_exit = False
+
+        def __init__(self) -> None:
+            self.started = Event()
+
+        def run(self) -> None:
+            self.started.set()
+            while not self.should_exit:
+                self.started.wait(0.01)
+
+    def server_factory(app, *, host: str, port: int):
+        created.update(app=app, host=host, port=port)
+        server = FakeServer()
+        created["server"] = server
+        return server
+
+    runtime = DesktopRuntime(
+        api_enabled=True,
+        port=9876,
+        server_factory=server_factory,
+    )
+    qtbot.addWidget(runtime.window)
+    runtime.start()
+    server = created["server"]
+    assert isinstance(server, FakeServer)
+    assert server.started.wait(1)
+    runtime.window.enter_replay()
+    runtime.window.start_replay()
+
+    runtime.window.close()
+
+    assert created["host"] == "127.0.0.1"
+    assert created["port"] == 9876
+    assert not runtime.window.replay_timer.isActive()
+    assert server.should_exit
+    assert runtime.api_thread is not None
+    assert runtime.api_thread.wait(3000)
