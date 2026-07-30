@@ -9,9 +9,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
-from xiangqi.adjudication import AdjudicationKind, Ruleset
+from xiangqi.adjudication import AdjudicationKind, MoveNature, Ruleset
 from xiangqi.board import Board
 from xiangqi.domain import Color, Coord, Move, Piece, PieceType
 from xiangqi.notation import NotationError, format_move
@@ -34,6 +41,11 @@ class PlayerRecord(_RecordModel):
 
 class AdjudicationRecord(_RecordModel):
     kind: AdjudicationKind
+    ruleset: Ruleset
+    cycle_start: int | None = Field(default=None, ge=0)
+    move_natures: tuple[MoveNature, ...] = ()
+    responsible_natures: tuple[MoveNature, ...] = ()
+    related_moves: tuple[int, ...] = ()
     reason: str
     responsible: Color | None = None
     rule_reference: str | None = None
@@ -102,9 +114,15 @@ class ResultRecord(_RecordModel):
     winner: Color | None = None
 
 
+class DrawEventRecord(_RecordModel):
+    action: Literal["offer", "accept", "reject"]
+    actor: Color
+    ply: int = Field(ge=0)
+
+
 class GameRecord(_RecordModel):
     format_version: Literal[1] = 1
-    created_at: datetime | None = None
+    created_at: datetime
     ruleset: Ruleset = Ruleset.CHINESE_2020
     players: tuple[PlayerRecord, PlayerRecord] = (
         PlayerRecord(name="红方", color=Color.RED),
@@ -114,11 +132,47 @@ class GameRecord(_RecordModel):
     initial_side: Color = Color.RED
     moves: tuple[MoveRecord, ...] = ()
     result: ResultRecord = ResultRecord(status="ongoing")
+    draw_events: tuple[DrawEventRecord, ...] = ()
+
+    @field_validator("created_at")
+    @classmethod
+    def created_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("创建时间必须包含时区")
+        return value
 
     @model_validator(mode="after")
-    def players_cover_both_colors(self) -> GameRecord:
+    def validate_record_metadata(self) -> GameRecord:
         if {player.color for player in self.players} != {Color.RED, Color.BLACK}:
             raise ValueError("两名玩家必须分别控制红方和黑方")
+        pending: DrawEventRecord | None = None
+        accepted = False
+        previous_ply = -1
+        for event in self.draw_events:
+            if event.ply > len(self.moves):
+                raise ValueError("和棋事件步数超过棋谱长度")
+            if event.ply < previous_ply:
+                raise ValueError("和棋事件步数顺序无效")
+            previous_ply = event.ply
+            if event.action == "offer":
+                if pending is not None or accepted:
+                    raise ValueError("和棋提议顺序无效")
+                pending = event
+                continue
+            if (
+                pending is None
+                or event.actor is not pending.actor.opponent
+                or event.ply != pending.ply
+            ):
+                raise ValueError("和棋回应必须紧随对方在同一局面的提议")
+            accepted = event.action == "accept"
+            pending = None
+        negotiated = (
+            self.result.status == "draw"
+            and self.result.reason == "双方同意和棋"
+        )
+        if negotiated != accepted:
+            raise ValueError("协商和棋必须保存双方依次提议和同意的事件")
         return self
 
 

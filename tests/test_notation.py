@@ -64,3 +64,60 @@ def test_parse_text_reports_exact_line_and_does_not_mutate_previous_replay() -> 
 def test_blank_lines_are_ignored_but_report_physical_line_number() -> None:
     with pytest.raises(NotationError, match="第 3 行"):
         replay_text("炮二平五\n\n帅五进三")
+
+
+@pytest.mark.parametrize(
+    ("ranks", "expected"),
+    [
+        ((2, 4, 6, 8), ("前兵平二", "二兵平二", "三兵进一", "后兵进一")),
+        (
+            (0, 2, 4, 6, 8),
+            ("前兵平二", "二兵平二", "三兵平二", "四兵进一", "后兵进一"),
+        ),
+    ],
+)
+def test_four_or_five_same_file_pawns_format_and_replay_exactly(
+    ranks: tuple[int, ...], expected: tuple[str, ...]
+) -> None:
+    pawn = Piece(Color.RED, PieceType.PAWN)
+    board = (
+        Board.empty()
+        .place(Coord(4, 9), Piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(3, 0), Piece(Color.BLACK, PieceType.GENERAL))
+    )
+    for rank in ranks:
+        board = board.place(Coord(0, rank), pawn)
+
+    destinations = tuple(
+        Coord(1, rank) if rank <= 4 else Coord(0, rank - 1)
+        for rank in ranks
+    )
+    actual = tuple(
+        format_move(board, _move(board, Coord(0, rank), destination))
+        for rank, destination in zip(ranks, destinations, strict=True)
+    )
+
+    assert actual == expected
+    for notation, rank in zip(expected, ranks, strict=True):
+        replay = replay_text(notation, initial_board=board)
+        assert replay.moves[0].move.start == Coord(0, rank)
+
+
+def test_same_file_black_pawns_are_ordered_from_black_players_view() -> None:
+    pawn = Piece(Color.BLACK, PieceType.PAWN)
+    ranks = (7, 5, 3, 1)
+    board = (
+        Board.empty()
+        .place(Coord(4, 9), Piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(3, 0), Piece(Color.BLACK, PieceType.GENERAL))
+    )
+    for rank in ranks:
+        board = board.place(Coord(0, rank), pawn)
+    destinations = (Coord(1, 7), Coord(1, 5), Coord(0, 4), Coord(0, 2))
+
+    actual = tuple(
+        format_move(board, _move(board, Coord(0, rank), destination))
+        for rank, destination in zip(ranks, destinations, strict=True)
+    )
+
+    assert actual == ("前卒平８", "二卒平８", "三卒进１", "后卒进１")

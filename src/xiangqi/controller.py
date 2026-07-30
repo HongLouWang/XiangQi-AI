@@ -7,6 +7,7 @@ import secrets
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from threading import RLock
@@ -25,6 +26,7 @@ from xiangqi.domain import Color, Coord, Move, PositionKind, PositionResult
 from xiangqi.notation import format_move
 from xiangqi.record import (
     AdjudicationRecord,
+    DrawEventRecord,
     GameRecord,
     MoveRecord,
     PlayerRecord,
@@ -140,7 +142,12 @@ class GameController:
             Color.BLACK: SideControl(ControllerKind.HUMAN),
         }
         self._version = 0
-        self._pending_draw: Color | None = None
+        self._pending_draw: Color | None = (
+            validated.draw_events[-1].actor
+            if validated.draw_events
+            and validated.draw_events[-1].action == "offer"
+            else None
+        )
         self._replay_cursor: int | None = None
         self._base_record = validated.model_copy(
             update={"result": ResultRecord(status="ongoing")}
@@ -179,6 +186,7 @@ class GameController:
     ) -> GameController:
         board = initial_board or Board.standard()
         record = GameRecord(
+            created_at=datetime.now(UTC),
             ruleset=ruleset,
             players=players or GameRecord.model_fields["players"].default,
             initial_fen=board.to_fen(),
@@ -292,11 +300,8 @@ class GameController:
                 notation=notation,
                 position_after=after.position_key(next_side),
                 in_check=position.in_check,
-                adjudication=AdjudicationRecord(
-                    kind=adjudication.kind,
-                    reason=adjudication.reason,
-                    responsible=adjudication.responsible,
-                    rule_reference=adjudication.rule_reference,
+                adjudication=self._adjudication_record(
+                    adjudication, len(frames)
                 ),
             )
             self._current = _ReplayState(
@@ -336,6 +341,7 @@ class GameController:
                 update={
                     "moves": self._base_record.moves[:count],
                     "result": ResultRecord(status="ongoing"),
+                    "draw_events": self._draw_events_for_resume(count),
                 }
             )
             self._current = self._replay(self._base_record, count)
@@ -361,6 +367,18 @@ class GameController:
             self._authorize(actor, control_token)
             before = self._current.board
             self._pending_draw = actor
+            self._base_record = self._base_record.model_copy(
+                update={
+                    "draw_events": (
+                        *self._base_record.draw_events,
+                        DrawEventRecord(
+                            action="offer",
+                            actor=actor,
+                            ply=len(self._current.records),
+                        ),
+                    )
+                }
+            )
             return self._finish_event(
                 GameEventKind.DRAW_OFFERED, before_board=before
             )
@@ -382,6 +400,19 @@ class GameController:
             self._authorize(actor, control_token)
             before = self._current.board
             self._pending_draw = None
+            response = DrawEventRecord(
+                action="accept" if accept else "reject",
+                actor=actor,
+                ply=len(self._current.records),
+            )
+            self._base_record = self._base_record.model_copy(
+                update={
+                    "draw_events": (
+                        *self._base_record.draw_events,
+                        response,
+                    )
+                }
+            )
             if accept:
                 self._current = _ReplayState(
                     board=self._current.board,
@@ -479,6 +510,7 @@ class GameController:
                 update={
                     "moves": self._base_record.moves[:count],
                     "result": ResultRecord(status="ongoing"),
+                    "draw_events": self._draw_events_for_resume(count),
                 }
             )
             self._current = self._replay(self._base_record, count)
@@ -501,7 +533,7 @@ class GameController:
             before = self.get_state().board
             self._base_record = replacement._base_record
             self._current = replacement._current
-            self._pending_draw = None
+            self._pending_draw = replacement._pending_draw
             self._replay_cursor = None
             return self._finish_event(
                 GameEventKind.RECORD_LOADED, before_board=before
@@ -590,9 +622,12 @@ class GameController:
             adjudication = self._adjudicator().evaluate(frames)
             if item.in_check != position.in_check:
                 raise ControlError(f"第 {index} 步将军标记与重放局面不一致")
-            if item.adjudication is not None and (
-                item.adjudication.kind is not adjudication.kind
-                or item.adjudication.responsible is not adjudication.responsible
+            expected_adjudication = self._adjudication_record(
+                adjudication, len(frames)
+            )
+            if (
+                item.adjudication is not None
+                and item.adjudication != expected_adjudication
             ):
                 raise ControlError(f"第 {index} 步裁决信息与重放结果不一致")
             normalized.append(
@@ -601,12 +636,7 @@ class GameController:
                     notation=item.notation,
                     position_after=item.position_after,
                     in_check=position.in_check,
-                    adjudication=AdjudicationRecord(
-                        kind=adjudication.kind,
-                        reason=adjudication.reason,
-                        responsible=adjudication.responsible,
-                        rule_reference=adjudication.rule_reference,
-                    ),
+                    adjudication=expected_adjudication,
                 )
             )
         position = evaluate_position(board, side)
@@ -662,6 +692,40 @@ class GameController:
                 "result": self._current.result
                 or ResultRecord(status="ongoing"),
             }
+        )
+
+    def _draw_events_for_resume(
+        self, ply: int
+    ) -> tuple[DrawEventRecord, ...]:
+        events = [
+            event
+            for event in self._base_record.draw_events
+            if event.ply <= ply
+        ]
+        if events and events[-1].action == "accept":
+            events = events[:-2]
+        elif events and events[-1].action == "offer":
+            events = events[:-1]
+        return tuple(events)
+
+    def _adjudication_record(
+        self, adjudication: Adjudication, ply: int
+    ) -> AdjudicationRecord:
+        related_moves = (
+            tuple(range(adjudication.cycle_start + 1, ply + 1))
+            if adjudication.cycle_start is not None
+            else ()
+        )
+        return AdjudicationRecord(
+            kind=adjudication.kind,
+            ruleset=adjudication.ruleset,
+            cycle_start=adjudication.cycle_start,
+            move_natures=adjudication.move_natures,
+            responsible_natures=adjudication.responsible_natures,
+            related_moves=related_moves,
+            reason=adjudication.reason,
+            responsible=adjudication.responsible,
+            rule_reference=adjudication.rule_reference,
         )
 
     def _finish_event(

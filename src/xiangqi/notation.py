@@ -61,9 +61,15 @@ def _prefix(board: Board, move: Move) -> str:
         return name + _number(
             move.piece.color, _file_number(move.piece.color, move.start.file)
         )
-    if len(peers) > 3:
-        raise NotationError("同一路超过三个同类棋子，无法使用前中后记谱")
-    labels = ("前", "后") if len(peers) == 2 else ("前", "中", "后")
+    labels_by_count = {
+        2: ("前", "后"),
+        3: ("前", "中", "后"),
+        4: ("前", "二", "三", "后"),
+        5: ("前", "二", "三", "四", "后"),
+    }
+    if len(peers) not in labels_by_count:
+        raise NotationError("同一路同类棋子数量无法使用标准纵线记谱")
+    labels = labels_by_count[len(peers)]
     return labels[peers.index(move.start)] + name
 
 

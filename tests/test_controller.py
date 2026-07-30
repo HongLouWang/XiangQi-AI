@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from threading import Event, Thread
 
 import pytest
@@ -50,6 +51,7 @@ def _record(
             )
         )
     return GameRecord(
+        created_at=datetime.now(UTC),
         ruleset=ruleset,
         initial_fen=fen,
         initial_side=side,
@@ -305,6 +307,11 @@ def test_import_rejects_incorrect_per_move_adjudication_metadata() -> None:
         update={
             "adjudication": AdjudicationRecord(
                 kind=AdjudicationKind.DRAW,
+                ruleset=record.ruleset,
+                cycle_start=0,
+                move_natures=(),
+                responsible_natures=(),
+                related_moves=(1,),
                 reason="伪造裁决",
             )
         }
@@ -353,3 +360,62 @@ def test_imported_terminal_metadata_must_match_replayed_position() -> None:
 
     with pytest.raises(ControlError, match="结果"):
         GameController.from_record(record)
+
+
+def test_new_controller_sets_utc_creation_time() -> None:
+    created_at = GameController.new().record.created_at
+
+    assert created_at is not None
+    assert created_at.tzinfo is not None
+    assert created_at.utcoffset() == timedelta(0)
+
+
+def test_draw_offer_reject_and_accept_are_persisted() -> None:
+    controller = GameController.new()
+    controller.offer_draw(Color.RED)
+    controller.respond_draw(Color.BLACK, False)
+    controller.offer_draw(Color.BLACK)
+    controller.respond_draw(Color.RED, True)
+
+    assert [
+        (event.action, event.actor)
+        for event in controller.record.draw_events
+    ] == [
+        ("offer", Color.RED),
+        ("reject", Color.BLACK),
+        ("offer", Color.BLACK),
+        ("accept", Color.RED),
+    ]
+
+
+def test_import_restores_pending_draw_offer() -> None:
+    controller = GameController.new()
+    controller.offer_draw(Color.RED)
+
+    restored = GameController.from_record(controller.record)
+
+    assert restored.state.pending_draw is Color.RED
+
+
+def test_load_record_restores_pending_draw_offer(tmp_path) -> None:
+    source = GameController.new()
+    source.offer_draw(Color.BLACK)
+    path = tmp_path / "pending.json"
+    source.export_record(path)
+    target = GameController.new()
+
+    target.load_record(path)
+
+    assert target.state.pending_draw is Color.BLACK
+
+
+def test_undo_after_accepted_draw_keeps_record_importable() -> None:
+    controller = GameController.new()
+    controller.offer_draw(Color.RED)
+    controller.respond_draw(Color.BLACK, True)
+
+    controller.undo()
+
+    assert controller.record.result.status == "ongoing"
+    assert controller.record.draw_events == ()
+    assert GameController.from_record(controller.record).state.result is None
