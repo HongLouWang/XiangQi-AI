@@ -34,6 +34,8 @@ class MainWindow(QMainWindow):
     """Game controls, player summary, moves and non-destructive replay."""
 
     controller_changed = Signal()
+    controller_replaced = Signal(object)
+    external_controller_replacement = Signal(object)
     closing = Signal()
 
     def __init__(
@@ -47,6 +49,9 @@ class MainWindow(QMainWindow):
         self.controller = controller or GameController.new()
         self.replay_timer = QTimer(self)
         self.replay_timer.timeout.connect(self.replay_next)
+        self.external_controller_replacement.connect(
+            self._replace_controller
+        )
 
         self.red_player_label = QLabel()
         self.black_player_label = QLabel()
@@ -132,6 +137,8 @@ class MainWindow(QMainWindow):
         self.controller.register_callback(lambda _event: self.controller_changed.emit())
 
     def _replace_controller(self, controller: GameController) -> None:
+        if controller is self.controller:
+            return
         self.stop_replay()
         old_board = self.board_widget
         self.controller = controller
@@ -140,6 +147,7 @@ class MainWindow(QMainWindow):
         old_board.deleteLater()
         self._bind_controller()
         self.refresh()
+        self.controller_replaced.emit(controller)
 
     def new_game(
         self,

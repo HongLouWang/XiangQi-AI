@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication
 
-from xiangqi.api import create_api
+from xiangqi.api import ControllerHub, create_api
 from xiangqi.controller import GameController
 from xiangqi.ui.main_window import MainWindow
 
@@ -65,18 +65,26 @@ class DesktopRuntime:
     ) -> None:
         if not 1 <= port <= 65535:
             raise ValueError("端口必须在 1 到 65535 之间")
-        self.controller = GameController.new()
-        self.window = MainWindow(self.controller)
+        self.controller_hub = ControllerHub(GameController.new())
+        self.window = MainWindow(self.controller_hub.current)
+        self.window.controller_replaced.connect(self.controller_hub.replace)
+        self.controller_hub.subscribe(
+            self.window.external_controller_replacement.emit
+        )
         self.api_thread: ApiServerThread | None = None
         self._shutting_down = False
         if api_enabled:
             server = server_factory(
-                create_api(self.controller),
+                create_api(self.controller_hub),
                 host=LOCAL_API_HOST,
                 port=port,
             )
             self.api_thread = ApiServerThread(server)
         self.window.closing.connect(self.shutdown)
+
+    @property
+    def controller(self) -> GameController:
+        return self.controller_hub.current
 
     def start(self) -> None:
         if self.api_thread is not None and not self.api_thread.isRunning():

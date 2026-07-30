@@ -288,3 +288,39 @@ def test_close_stops_replay_and_local_api_thread(qtbot) -> None:
     assert server.should_exit
     assert runtime.api_thread is not None
     assert runtime.api_thread.wait(3000)
+
+
+def test_runtime_api_tracks_new_game_and_import_controllers(
+    qtbot, tmp_path: Path
+) -> None:
+    created: dict[str, object] = {}
+
+    class FakeServer:
+        should_exit = False
+
+        def run(self) -> None:
+            return None
+
+    def server_factory(app, *, host: str, port: int):
+        created["app"] = app
+        return FakeServer()
+
+    runtime = DesktopRuntime(api_enabled=True, server_factory=server_factory)
+    qtbot.addWidget(runtime.window)
+    client = __import__(
+        "fastapi.testclient", fromlist=["TestClient"]
+    ).TestClient(created["app"])
+
+    runtime.window.new_game(ruleset=Ruleset.ASIAN_2003)
+
+    assert runtime.controller is runtime.window.controller
+    assert client.get("/state").json()["ruleset"] == "asian_2003"
+
+    imported = GameController.new()
+    imported.make_move(Coord(0, 6), Coord(0, 5))
+    record_path = tmp_path / "runtime-import.json"
+    imported.export_record(record_path)
+    runtime.window.import_path(record_path)
+
+    assert runtime.controller is runtime.window.controller
+    assert client.get("/state").json()["ply"] == 1

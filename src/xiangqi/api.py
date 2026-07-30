@@ -10,6 +10,8 @@ import asyncio
 import queue
 import secrets
 from collections.abc import Mapping
+from pathlib import Path
+from threading import RLock
 from typing import Any, Literal
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -26,6 +28,39 @@ from xiangqi.controller import (
     StaleVersionError,
 )
 from xiangqi.domain import Color, Coord
+from xiangqi.notation import replay_text
+from xiangqi.record import MoveRecord
+from xiangqi.rules import evaluate_position
+
+
+class ControllerHub:
+    """Thread-safe, replaceable reference to the active game controller."""
+
+    def __init__(self, controller: GameController) -> None:
+        self._current = controller
+        self._lock = RLock()
+        self._listeners: list[Any] = []
+
+    @property
+    def current(self) -> GameController:
+        with self._lock:
+            return self._current
+
+    def replace(self, controller: GameController) -> None:
+        with self._lock:
+            if controller is self._current:
+                return
+            self._current = controller
+            listeners = tuple(self._listeners)
+        for listener in listeners:
+            listener(controller)
+
+    def subscribe(self, listener: Any) -> None:
+        with self._lock:
+            self._listeners.append(listener)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.current, name)
 
 
 class _Command(BaseModel):
@@ -61,6 +96,7 @@ class SideControlCommand(_Command):
 
 class RecordImportCommand(_Command):
     path: str = Field(min_length=1)
+    format: Literal["json", "text", "txt", "notation"] = "json"
 
 
 class RecordExportCommand(_Command):
@@ -76,34 +112,43 @@ class EventBroker:
             raise ValueError("event_queue_size 必须大于零")
         self._queue_size = queue_size
         self._subscribers: set[queue.Queue[Any]] = set()
+        self._lock = RLock()
 
     def subscribe(self) -> queue.Queue[Any]:
         subscriber: queue.Queue[Any] = queue.Queue(self._queue_size)
-        self._subscribers.add(subscriber)
+        with self._lock:
+            self._subscribers.add(subscriber)
         return subscriber
 
     def unsubscribe(self, subscriber: queue.Queue[Any]) -> None:
-        self._subscribers.discard(subscriber)
+        with self._lock:
+            self._subscribers.discard(subscriber)
+
+    @property
+    def subscriber_count(self) -> int:
+        with self._lock:
+            return len(self._subscribers)
 
     def publish(self, event: Any) -> None:
         # Replacing the oldest item bounds memory and guarantees that the newest
         # transition, especially a terminal result, is never silently discarded.
-        for subscriber in tuple(self._subscribers):
-            try:
-                subscriber.put_nowait(event)
-            except queue.Full:
+        with self._lock:
+            for subscriber in tuple(self._subscribers):
                 try:
-                    queued = subscriber.get_nowait()
-                except queue.Empty:
-                    queued = None
-                if (
-                    queued is not None
-                    and getattr(queued, "result", None) is not None
-                    and getattr(event, "result", None) is None
-                ):
-                    subscriber.put_nowait(queued)
-                    continue
-                subscriber.put_nowait(event)
+                    subscriber.put_nowait(event)
+                except queue.Full:
+                    try:
+                        queued = subscriber.get_nowait()
+                    except queue.Empty:
+                        queued = None
+                    if (
+                        queued is not None
+                        and getattr(queued, "result", None) is not None
+                        and getattr(event, "result", None) is None
+                    ):
+                        subscriber.put_nowait(queued)
+                        continue
+                    subscriber.put_nowait(event)
 
 
 def _coord(value: tuple[int, int]) -> Coord:
@@ -122,23 +167,33 @@ def _adjudication(value: Any) -> dict[str, Any] | None:
         return None
     return {
         "kind": value.kind.value,
+        "ruleset": value.ruleset.value,
+        "cycle_start": value.cycle_start,
         "reason": value.reason,
         "responsible": (
             None if value.responsible is None else value.responsible.value
         ),
+        "move_natures": [nature.value for nature in value.move_natures],
+        "responsible_natures": [
+            nature.value for nature in value.responsible_natures
+        ],
         "rule_reference": value.rule_reference,
+    }
+
+
+def _board(board: Any) -> dict[str, Any]:
+    return {
+        f"{coord.file},{coord.rank}": {
+            "color": piece.color.value,
+            "kind": piece.kind.value,
+        }
+        for coord, piece in board.pieces.items()
     }
 
 
 def _state(state: ControllerState) -> dict[str, Any]:
     return {
-        "board": {
-            f"{coord.file},{coord.rank}": {
-                "color": piece.color.value,
-                "kind": piece.kind.value,
-            }
-            for coord, piece in state.board.pieces.items()
-        },
+        "board": _board(state.board),
         "fen": state.board.to_fen(),
         "side_to_move": state.side_to_move.value,
         "ruleset": state.ruleset.value,
@@ -177,6 +232,8 @@ def _event(event: GameEvent) -> dict[str, Any]:
     return {
         "kind": event.kind.value,
         "version": event.version,
+        "before_board": _board(event.before_board),
+        "after_board": _board(event.after_board),
         "move": None if event.move is None else event.move.to_dict(),
         "next_side": event.next_side.value,
         "in_check": event.in_check,
@@ -218,6 +275,105 @@ def _verify_version(controller: GameController, expected: int) -> None:
         )
 
 
+def _claim_side(
+    controller: GameController, side: Color, command: _Command
+) -> dict[str, Any]:
+    lease = controller.claim_side(
+        side,
+        command.controller_id,
+        ControllerKind.NETWORK,
+        expected_version=command.expected_version,
+    )
+    return _success(
+        controller,
+        request_id=command.request_id,
+        token=lease.token,
+    )
+
+
+def _release_side(
+    controller: GameController, side: Color, command: _Command
+) -> dict[str, Any]:
+    event = controller.release_side(
+        side,
+        command.controller_id,
+        command.token or "",
+        expected_version=command.expected_version,
+    )
+    return _success(
+        controller, event=event, request_id=command.request_id
+    )
+
+
+def _move(
+    controller: GameController, command: MoveCommand
+) -> dict[str, Any]:
+    _authorize_identity(
+        controller, command, controller.get_state().side_to_move
+    )
+    event = controller.make_move(
+        _coord(command.start),
+        _coord(command.end),
+        actor=command.token,
+        expected_version=command.expected_version,
+    )
+    return _success(
+        controller, event=event, request_id=command.request_id
+    )
+
+
+def _undo(
+    controller: GameController, command: UndoCommand
+) -> dict[str, Any]:
+    _authorize_identity(controller, command)
+    event = controller.undo(
+        command.steps, expected_version=command.expected_version
+    )
+    return _success(
+        controller, event=event, request_id=command.request_id
+    )
+
+
+def _offer_draw(
+    controller: GameController, command: DrawOfferCommand
+) -> dict[str, Any]:
+    _authorize_identity(controller, command, command.side)
+    event = controller.offer_draw(
+        command.side,
+        control_token=command.token,
+        expected_version=command.expected_version,
+    )
+    return _success(
+        controller, event=event, request_id=command.request_id
+    )
+
+
+def _respond_draw(
+    controller: GameController, command: DrawResponseCommand
+) -> dict[str, Any]:
+    _authorize_identity(controller, command, command.side)
+    event = controller.respond_draw(
+        command.side,
+        command.accept,
+        control_token=command.token,
+        expected_version=command.expected_version,
+    )
+    return _success(
+        controller, event=event, request_id=command.request_id
+    )
+
+
+def _export_record(
+    controller: GameController, command: RecordExportCommand
+) -> dict[str, Any]:
+    _authorize_identity(controller, command)
+    _verify_version(controller, command.expected_version)
+    controller.export_record(command.path, command.format)
+    return _success(
+        controller, request_id=command.request_id, path=command.path
+    )
+
+
 def _authorize_identity(
     controller: GameController,
     command: _Command,
@@ -233,7 +389,7 @@ def _authorize_identity(
         if control.kind is not ControllerKind.HUMAN
     ]
     if not external:
-        return
+        raise ControlError("网络客户端尚未取得控制权")
     for control in external:
         if (
             control.controller_id == command.controller_id
@@ -245,15 +401,74 @@ def _authorize_identity(
 
 
 def create_api(
-    controller: GameController, *, event_queue_size: int = 64
+    controller: GameController | ControllerHub, *, event_queue_size: int = 64
 ) -> FastAPI:
     """Create an unbound ASGI application around ``controller``."""
 
+    hub = (
+        controller
+        if isinstance(controller, ControllerHub)
+        else ControllerHub(controller)
+    )
+    controller = hub
     app = FastAPI(title="中国象棋本机控制接口", version="1.0")
     broker = EventBroker(event_queue_size)
     controller.register_callback(broker.publish)
+    hub.subscribe(lambda active: active.register_callback(broker.publish))
     app.state.controller = controller
+    app.state.controller_hub = hub
     app.state.event_broker = broker
+    processed_requests: set[tuple[str, str]] = set()
+    request_lock = RLock()
+
+    def execute_once(command: _Command, action: Any) -> dict[str, Any]:
+        key = (command.controller_id, command.request_id)
+        with request_lock:
+            if key in processed_requests:
+                raise ControlError(
+                    f"重复 request_id: {command.request_id}"
+                )
+            processed_requests.add(key)
+        return action()
+
+    def import_into_active(command: RecordImportCommand) -> dict[str, Any]:
+        _authorize_identity(controller, command)
+        if command.format == "json":
+            event = controller.load_record(
+                command.path, expected_version=command.expected_version
+            )
+            return _success(
+                controller, event=event, request_id=command.request_id
+            )
+        _verify_version(controller, command.expected_version)
+        text = Path(command.path).read_text(encoding="utf-8")
+        replayed = replay_text(text)
+        base = GameController.new().record
+        moves: list[MoveRecord] = []
+        before = GameController.new().get_state().board
+        side = Color.RED
+        for item in replayed.moves:
+            after = before.move_unchecked(item.move.start, item.move.end)
+            position = evaluate_position(after, side.opponent)
+            moves.append(
+                MoveRecord.from_move(
+                    item.move,
+                    notation=item.notation,
+                    position_after=item.position_after,
+                    in_check=position.in_check,
+                )
+            )
+            before = after
+            side = side.opponent
+        replacement = GameController.from_record(
+            base.model_copy(update={"moves": tuple(moves)})
+        )
+        hub.replace(replacement)
+        return _success(
+            controller,
+            request_id=command.request_id,
+            path=command.path,
+        )
 
     @app.exception_handler(StaleVersionError)
     async def stale_error(
@@ -326,97 +541,58 @@ def create_api(
 
     @app.post("/control/{side}/claim")
     def claim(side: Color, command: _Command) -> dict[str, Any]:
-        lease = controller.claim_side(
-            side,
-            command.controller_id,
-            ControllerKind.NETWORK,
-            expected_version=command.expected_version,
-        )
-        return _success(
-            controller,
-            request_id=command.request_id,
-            token=lease.token,
+        return execute_once(
+            command,
+            lambda: _claim_side(controller, side, command),
         )
 
     @app.post("/control/{side}/release")
     def release(side: Color, command: _Command) -> dict[str, Any]:
-        event = controller.release_side(
-            side,
-            command.controller_id,
-            command.token or "",
-            expected_version=command.expected_version,
-        )
-        return _success(
-            controller, event=event, request_id=command.request_id
+        return execute_once(
+            command,
+            lambda: _release_side(controller, side, command),
         )
 
     @app.post("/move")
     def move(command: MoveCommand) -> dict[str, Any]:
-        _authorize_identity(
-            controller, command, controller.get_state().side_to_move
-        )
-        event = controller.make_move(
-            _coord(command.start),
-            _coord(command.end),
-            actor=command.token,
-            expected_version=command.expected_version,
-        )
-        return _success(
-            controller, event=event, request_id=command.request_id
+        return execute_once(
+            command,
+            lambda: _move(controller, command),
         )
 
     @app.post("/undo")
     def undo(command: UndoCommand) -> dict[str, Any]:
-        _authorize_identity(controller, command)
-        event = controller.undo(
-            command.steps, expected_version=command.expected_version
-        )
-        return _success(
-            controller, event=event, request_id=command.request_id
+        return execute_once(
+            command,
+            lambda: _undo(controller, command),
         )
 
     @app.post("/draw/offer")
     def offer_draw(command: DrawOfferCommand) -> dict[str, Any]:
-        _authorize_identity(controller, command, command.side)
-        event = controller.offer_draw(
-            command.side,
-            control_token=command.token,
-            expected_version=command.expected_version,
-        )
-        return _success(
-            controller, event=event, request_id=command.request_id
+        return execute_once(
+            command,
+            lambda: _offer_draw(controller, command),
         )
 
     @app.post("/draw/respond")
     def respond_draw(command: DrawResponseCommand) -> dict[str, Any]:
-        _authorize_identity(controller, command, command.side)
-        event = controller.respond_draw(
-            command.side,
-            command.accept,
-            control_token=command.token,
-            expected_version=command.expected_version,
-        )
-        return _success(
-            controller, event=event, request_id=command.request_id
+        return execute_once(
+            command,
+            lambda: _respond_draw(controller, command),
         )
 
     @app.post("/record/import")
     def import_record(command: RecordImportCommand) -> dict[str, Any]:
-        _authorize_identity(controller, command)
-        event = controller.load_record(
-            command.path, expected_version=command.expected_version
-        )
-        return _success(
-            controller, event=event, request_id=command.request_id
+        return execute_once(
+            command,
+            lambda: import_into_active(command),
         )
 
     @app.post("/record/export")
     def export_record(command: RecordExportCommand) -> dict[str, Any]:
-        _authorize_identity(controller, command)
-        _verify_version(controller, command.expected_version)
-        controller.export_record(command.path, command.format)
-        return _success(
-            controller, request_id=command.request_id, path=command.path
+        return execute_once(
+            command,
+            lambda: _export_record(controller, command),
         )
 
     command_models: Mapping[str, type[_Command]] = {
@@ -436,85 +612,27 @@ def create_api(
         if model is None:
             raise ControlError(f"不支持的 WebSocket 命令: {command_name}")
         command = model.model_validate(raw)
-        if isinstance(command, SideControlCommand):
-            if command_name == "claim":
-                lease = controller.claim_side(
-                    command.side,
-                    command.controller_id,
-                    ControllerKind.NETWORK,
-                    expected_version=command.expected_version,
+        def dispatch() -> dict[str, Any]:
+            if isinstance(command, SideControlCommand):
+                return (
+                    _claim_side(controller, command.side, command)
+                    if command_name == "claim"
+                    else _release_side(controller, command.side, command)
                 )
-                return _success(
-                    controller,
-                    request_id=command.request_id,
-                    token=lease.token,
-                )
-            event = controller.release_side(
-                command.side,
-                command.controller_id,
-                command.token or "",
-                expected_version=command.expected_version,
-            )
-            return _success(
-                controller, event=event, request_id=command.request_id
-            )
-        if isinstance(command, MoveCommand):
-            _authorize_identity(
-                controller, command, controller.get_state().side_to_move
-            )
-            event = controller.make_move(
-                _coord(command.start),
-                _coord(command.end),
-                actor=command.token,
-                expected_version=command.expected_version,
-            )
-            return _success(
-                controller, event=event, request_id=command.request_id
-            )
-        if isinstance(command, UndoCommand):
-            _authorize_identity(controller, command)
-            event = controller.undo(
-                command.steps, expected_version=command.expected_version
-            )
-            return _success(
-                controller, event=event, request_id=command.request_id
-            )
-        if isinstance(command, DrawOfferCommand):
-            _authorize_identity(controller, command, command.side)
-            event = controller.offer_draw(
-                command.side,
-                control_token=command.token,
-                expected_version=command.expected_version,
-            )
-            return _success(
-                controller, event=event, request_id=command.request_id
-            )
-        if isinstance(command, DrawResponseCommand):
-            _authorize_identity(controller, command, command.side)
-            event = controller.respond_draw(
-                command.side,
-                command.accept,
-                control_token=command.token,
-                expected_version=command.expected_version,
-            )
-            return _success(
-                controller, event=event, request_id=command.request_id
-            )
-        if isinstance(command, RecordImportCommand):
-            _authorize_identity(controller, command)
-            event = controller.load_record(
-                command.path, expected_version=command.expected_version
-            )
-            return _success(
-                controller, event=event, request_id=command.request_id
-            )
-        assert isinstance(command, RecordExportCommand)
-        _authorize_identity(controller, command)
-        _verify_version(controller, command.expected_version)
-        controller.export_record(command.path, command.format)
-        return _success(
-            controller, request_id=command.request_id, path=command.path
-        )
+            if isinstance(command, MoveCommand):
+                return _move(controller, command)
+            if isinstance(command, UndoCommand):
+                return _undo(controller, command)
+            if isinstance(command, DrawOfferCommand):
+                return _offer_draw(controller, command)
+            if isinstance(command, DrawResponseCommand):
+                return _respond_draw(controller, command)
+            if isinstance(command, RecordImportCommand):
+                return import_into_active(command)
+            assert isinstance(command, RecordExportCommand)
+            return _export_record(controller, command)
+
+        return execute_once(command, dispatch)
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
