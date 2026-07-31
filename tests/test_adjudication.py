@@ -457,9 +457,7 @@ def test_chinese_bilateral_prohibited_move_table_is_explicit(
 
     assert result.responsible is responsible
     assert result.kind is (
-        AdjudicationKind.DRAW
-        if responsible is None
-        else AdjudicationKind.MUST_CHANGE
+        AdjudicationKind.DRAW if responsible is None else AdjudicationKind.MUST_CHANGE
     )
     assert reference in result.rule_reference
 
@@ -486,9 +484,7 @@ def test_asian_bilateral_responsibility_table_is_explicit(
 
     assert result.responsible is responsible
     assert result.kind is (
-        AdjudicationKind.DRAW
-        if responsible is None
-        else AdjudicationKind.MUST_CHANGE
+        AdjudicationKind.DRAW if responsible is None else AdjudicationKind.MUST_CHANGE
     )
     assert table_item in result.rule_reference
 
@@ -508,9 +504,7 @@ def test_rulesets_explicitly_reverse_kill_versus_chase_priority() -> None:
     assert "Table 4-C" in asian.rule_reference
 
 
-def _two_attackers_frame(
-    *, target_kind: PieceType, rooted: bool
-) -> PositionFrame:
+def _two_attackers_frame(*, target_kind: PieceType, rooted: bool) -> PositionFrame:
     board = (
         Board.empty()
         .place(Coord(5, 0), _piece(Color.BLACK, PieceType.GENERAL))
@@ -522,16 +516,12 @@ def _two_attackers_frame(
         .place(Coord(3, 3), _piece(Color.BLACK, target_kind))
     )
     if rooted:
-        board = board.place(
-            Coord(5, 4), _piece(Color.BLACK, PieceType.HORSE)
-        )
+        board = board.place(Coord(5, 4), _piece(Color.BLACK, PieceType.HORSE))
     _, frame = _play(board, Color.RED, (2, 2), (3, 2))
     return frame
 
 
-def _single_attacker_frame(
-    *, target_kind: PieceType, rooted: bool
-) -> PositionFrame:
+def _single_attacker_frame(*, target_kind: PieceType, rooted: bool) -> PositionFrame:
     board = (
         Board.empty()
         .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
@@ -541,9 +531,7 @@ def _single_attacker_frame(
         .place(Coord(3, 4), _piece(Color.BLACK, target_kind))
     )
     if rooted:
-        board = board.place(
-            Coord(3, 0), _piece(Color.BLACK, PieceType.ROOK)
-        )
+        board = board.place(Coord(3, 0), _piece(Color.BLACK, PieceType.ROOK))
     _, frame = _play(board, Color.RED, (0, 7), (1, 5))
     return frame
 
@@ -587,9 +575,7 @@ def test_chinese_ordinary_chase_versus_joint_chase_uses_target_evidence(
     ordinary_frame = _single_attacker_frame(
         target_kind=ordinary_kind, rooted=ordinary_rooted
     )
-    joint_frame = _two_attackers_frame(
-        target_kind=ordinary_kind, rooted=True
-    )
+    joint_frame = _two_attackers_frame(target_kind=ordinary_kind, rooted=True)
     red_profile = adjudication_module._cycle_profile_with_evidence(
         (ordinary_frame,), (MoveNature.CHASE,)
     )
@@ -602,9 +588,7 @@ def test_chinese_ordinary_chase_versus_joint_chase_uses_target_evidence(
 
     assert decision.responsible is responsible
     assert decision.kind is (
-        AdjudicationKind.DRAW
-        if responsible is None
-        else AdjudicationKind.MUST_CHANGE
+        AdjudicationKind.DRAW if responsible is None else AdjudicationKind.MUST_CHANGE
     )
     assert reference in decision.reference
 
@@ -637,17 +621,12 @@ def test_nonqualifying_incidental_rook_attack_does_not_upgrade_profile() -> None
 
 def test_only_some_cycle_frames_chasing_rook_does_not_trigger_2692() -> None:
     rook_frame = _single_attacker_frame(target_kind=PieceType.ROOK, rooted=True)
-    cannon_frame = _single_attacker_frame(
-        target_kind=PieceType.CANNON, rooted=True
-    )
+    cannon_frame = _single_attacker_frame(target_kind=PieceType.CANNON, rooted=True)
     ordinary = adjudication_module._cycle_profile_with_evidence(
         (rook_frame, cannon_frame), (MoveNature.CHASE,) * 2
     )
     joint = adjudication_module._cycle_profile_with_evidence(
-        (
-            _two_attackers_frame(target_kind=PieceType.ROOK, rooted=True),
-        )
-        * 2,
+        (_two_attackers_frame(target_kind=PieceType.ROOK, rooted=True),) * 2,
         (MoveNature.CHASE,) * 2,
     )
 
@@ -686,10 +665,7 @@ def test_only_some_cycle_frames_chasing_unrooted_piece_does_not_trigger_2693() -
         (MoveNature.CHASE,) * 2,
     )
     joint = adjudication_module._cycle_profile_with_evidence(
-        (
-            _two_attackers_frame(target_kind=PieceType.CANNON, rooted=True),
-        )
-        * 2,
+        (_two_attackers_frame(target_kind=PieceType.CANNON, rooted=True),) * 2,
         (MoveNature.CHASE,) * 2,
     )
 
@@ -707,8 +683,7 @@ def test_both_sides_every_cycle_frame_chasing_rook_triggers_2692() -> None:
         for _ in range(2)
     )
     joint_frames = tuple(
-        _two_attackers_frame(target_kind=PieceType.ROOK, rooted=True)
-        for _ in range(2)
+        _two_attackers_frame(target_kind=PieceType.ROOK, rooted=True) for _ in range(2)
     )
     ordinary = adjudication_module._cycle_profile_with_evidence(
         ordinary_frames, (MoveNature.CHASE,) * 2
@@ -1058,6 +1033,5 @@ def test_real_transition_classifies_pressure_on_rooted_piece_as_follow(
 def test_aggressive_natures_keep_priority_over_permitted_move_natures() -> None:
     assert _perpetual_check_history()[0].nature is MoveNature.CHECK
     assert (
-        _rook_chase_history(target_kind=PieceType.CANNON)[0].nature
-        is MoveNature.CHASE
+        _rook_chase_history(target_kind=PieceType.CANNON)[0].nature is MoveNature.CHASE
     )

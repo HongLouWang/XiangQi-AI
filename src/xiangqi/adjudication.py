@@ -148,8 +148,7 @@ def _exchange_targets(
             continue
         accepted = board_after.move_unchecked(attack.target, move.end)
         if any(
-            candidate.end == move.end
-            for candidate in all_legal_moves(accepted, side)
+            candidate.end == move.end for candidate in all_legal_moves(accepted, side)
         ):
             targets.append(attack.target)
     return tuple(targets)
@@ -184,11 +183,8 @@ def _sacrifice_attackers(
         sorted(
             (
                 attacker
-                for attacker, target in _legal_capture_pairs(
-                    board_after, side.opponent
-                )
-                if target == move.end
-                and (attacker, move.start) not in before
+                for attacker, target in _legal_capture_pairs(board_after, side.opponent)
+                if target == move.end and (attacker, move.start) not in before
             ),
             key=lambda coord: (coord.rank, coord.file),
         )
@@ -258,9 +254,7 @@ class PositionFrame:
         sacrifice_attackers = _sacrifice_attackers(
             board_before, board_after, side, move
         )
-        followed_targets = tuple(
-            attack.target for attack in attacks if attack.rooted
-        )
+        followed_targets = tuple(attack.target for attack in attacks if attack.rooted)
         if is_in_check(board_after, side.opponent):
             nature = MoveNature.CHECK
             evidence = ClassificationEvidence(
@@ -285,9 +279,7 @@ class PositionFrame:
                 nature,
                 actors=tuple(dict.fromkeys(a.attacker for a in attacks)),
                 targets=tuple(
-                    attack.target
-                    for attack in attacks
-                    if _qualifies_as_chase(attack)
+                    attack.target for attack in attacks if _qualifies_as_chase(attack)
                 ),
                 rationale="产生可得子的新增合法攻击",
             )
@@ -534,9 +526,7 @@ _CHECK_PATTERNS = frozenset(
         _CyclePattern.CHECK_KILL_CHASE,
     }
 )
-_KILL_WITHOUT_CHECK_PATTERNS = frozenset(
-    {_CyclePattern.KILL, _CyclePattern.KILL_CHASE}
-)
+_KILL_WITHOUT_CHECK_PATTERNS = frozenset({_CyclePattern.KILL, _CyclePattern.KILL_CHASE})
 _CHASE_WITHOUT_CHECK_PATTERNS = frozenset(
     {
         _CyclePattern.CHASE,
@@ -555,16 +545,12 @@ class _CycleProfile:
 
 
 def _qualifies_as_chase(attack: TacticalAttack) -> bool:
-    return (
-        attack.attacker_piece.kind
-        not in (PieceType.GENERAL, PieceType.PAWN)
-        and (not attack.rooted or attack.target_value > attack.attacker_value)
+    return attack.attacker_piece.kind not in (PieceType.GENERAL, PieceType.PAWN) and (
+        not attack.rooted or attack.target_value > attack.attacker_value
     )
 
 
-def _has_indispensable_support(
-    frame: PositionFrame, attack: TacticalAttack
-) -> bool:
+def _has_indispensable_support(frame: PositionFrame, attack: TacticalAttack) -> bool:
     """Counterfactually prove that another friendly piece enables this chase."""
     for supporter, piece in frame.board_after.pieces.items():
         if (
@@ -619,22 +605,19 @@ def _cycle_profile_with_evidence(
     if pattern is not _CyclePattern.CHASE:
         return _CycleProfile(pattern)
     chase_frames = tuple(
-        frame for frame, nature in zip(frames, natures, strict=True)
+        frame
+        for frame, nature in zip(frames, natures, strict=True)
         if nature is MoveNature.CHASE
     )
     qualifying_by_frame = tuple(
         tuple(attack for attack in frame.attacks if _qualifies_as_chase(attack))
         for frame in chase_frames
     )
-    relevant = tuple(
-        attack for attacks in qualifying_by_frame for attack in attacks
-    )
+    relevant = tuple(attack for attacks in qualifying_by_frame for attack in attacks)
     target_kinds = frozenset(attack.target_piece.kind for attack in relevant)
     every_rook = bool(qualifying_by_frame) and all(
         attacks
-        and all(
-            attack.target_piece.kind is PieceType.ROOK for attack in attacks
-        )
+        and all(attack.target_piece.kind is PieceType.ROOK for attack in attacks)
         for attacks in qualifying_by_frame
     )
     every_unrooted = bool(qualifying_by_frame) and all(
@@ -644,20 +627,15 @@ def _cycle_profile_with_evidence(
     joint = bool(chase_frames) and all(
         any(_has_indispensable_support(frame, attack) for attack in attacks)
         or any(
-            len(target_attacks) >= 2
-            and all(attack.rooted for attack in target_attacks)
+            len(target_attacks) >= 2 and all(attack.rooted for attack in target_attacks)
             for target in {attack.target for attack in attacks}
             if (
                 target_attacks := tuple(
-                    attack
-                    for attack in attacks
-                    if attack.target == target
+                    attack for attack in attacks if attack.target == target
                 )
             )
         )
-        for frame, attacks in zip(
-            chase_frames, qualifying_by_frame, strict=True
-        )
+        for frame, attacks in zip(chase_frames, qualifying_by_frame, strict=True)
     )
     return _CycleProfile(
         _CyclePattern.JOINT_CHASE if joint else pattern,
@@ -746,12 +724,8 @@ def _chinese_bilateral_decision(
             "中国棋规2020 表项25.1、26.9.1（长将优先变着）",
             "双方均有禁止着法，长将或将类组合方须变着",
         )
-    if (
-        red in _KILL_WITHOUT_CHECK_PATTERNS
-    ) != (black in _KILL_WITHOUT_CHECK_PATTERNS):
-        responsible = (
-            Color.RED if red in _KILL_WITHOUT_CHECK_PATTERNS else Color.BLACK
-        )
+    if (red in _KILL_WITHOUT_CHECK_PATTERNS) != (black in _KILL_WITHOUT_CHECK_PATTERNS):
+        responsible = Color.RED if red in _KILL_WITHOUT_CHECK_PATTERNS else Color.BLACK
         return _TableDecision(
             AdjudicationKind.MUST_CHANGE,
             responsible,
@@ -797,12 +771,10 @@ def _asian_bilateral_decision(
     black = profiles[Color.BLACK].pattern
     if (red in _CHECK_PATTERNS) != (black in _CHECK_PATTERNS):
         responsible = Color.RED if red in _CHECK_PATTERNS else Color.BLACK
-    elif (
-        red in _CHASE_WITHOUT_CHECK_PATTERNS
-    ) != (black in _CHASE_WITHOUT_CHECK_PATTERNS):
-        responsible = (
-            Color.RED if red in _CHASE_WITHOUT_CHECK_PATTERNS else Color.BLACK
-        )
+    elif (red in _CHASE_WITHOUT_CHECK_PATTERNS) != (
+        black in _CHASE_WITHOUT_CHECK_PATTERNS
+    ):
+        responsible = Color.RED if red in _CHASE_WITHOUT_CHECK_PATTERNS else Color.BLACK
     else:
         return _TableDecision(
             AdjudicationKind.DRAW,
@@ -813,8 +785,7 @@ def _asian_bilateral_decision(
     return _TableDecision(
         AdjudicationKind.MUST_CHANGE,
         responsible,
-        "AXF 2003 Chapter 4 Table 4-C "
-        "(check over chase; chase over kill/TTC)",
+        "AXF 2003 Chapter 4 Table 4-C (check over chase; chase over kill/TTC)",
         "双方循环责任类别不同，较重的将、捉或杀/TTC方须变着",
     )
 
@@ -913,9 +884,7 @@ class Chinese2020Adjudicator(_AdjudicatorBase):
                 tuple(frame for frame in cycle.frames if frame.side is color),
                 tuple(
                     nature
-                    for frame, nature in zip(
-                        cycle.frames, effective, strict=True
-                    )
+                    for frame, nature in zip(cycle.frames, effective, strict=True)
                     if frame.side is color
                 ),
             )
@@ -949,9 +918,7 @@ class Asian2003Adjudicator(_AdjudicatorBase):
                 tuple(frame for frame in cycle.frames if frame.side is color),
                 tuple(
                     nature
-                    for frame, nature in zip(
-                        cycle.frames, effective, strict=True
-                    )
+                    for frame, nature in zip(cycle.frames, effective, strict=True)
                     if frame.side is color
                 ),
             )
