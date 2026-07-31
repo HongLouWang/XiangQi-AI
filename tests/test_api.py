@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
+
 from fastapi.testclient import TestClient
 
 from xiangqi.adjudication import Ruleset
@@ -384,6 +387,7 @@ def test_event_contains_before_after_boards_and_complete_adjudication() -> None:
         "responsible",
         "move_natures",
         "responsible_natures",
+        "related_moves",
         "rule_reference",
         "reason",
     }
@@ -429,6 +433,291 @@ def test_network_import_accepts_explicit_json_and_text_formats(
         )
         assert response.status_code == 200, response.json()
         assert hub.current.get_state().ply == 1
+
+
+def test_text_import_preserves_lease_increments_version_and_allows_undo(
+    tmp_path,
+) -> None:
+    source = GameController.new()
+    source.make_move(Coord(0, 6), Coord(0, 5))
+    text_path = tmp_path / "record.moves"
+    source.export_record(text_path, "text")
+
+    controller = GameController.new()
+    client = TestClient(create_api(controller))
+    claim = client.post("/control/red/claim", json=_command(request_id="claim-red"))
+    token = claim.json()["token"]
+    imported = client.post(
+        "/record/import",
+        json=_command(
+            request_id="import-text",
+            token=token,
+            expected_version=1,
+            path=str(text_path),
+            format="text",
+        ),
+    )
+
+    assert imported.status_code == 200, imported.json()
+    assert imported.json()["event"]["kind"] == "record_loaded"
+    assert imported.json()["version"] == 2
+    assert imported.json()["state"]["controllers"]["red"] == {
+        "kind": "network",
+        "controller_id": "remote-1",
+    }
+
+    undone = client.post(
+        "/undo",
+        json=_command(
+            request_id="undo-imported",
+            token=token,
+            expected_version=2,
+        ),
+    )
+    assert undone.status_code == 200, undone.json()
+    assert undone.json()["state"]["ply"] == 0
+
+
+def test_text_import_broadcasts_record_loaded_over_websocket(tmp_path) -> None:
+    source = GameController.new()
+    source.make_move(Coord(0, 6), Coord(0, 5))
+    text_path = tmp_path / "record.moves"
+    source.export_record(text_path, "text")
+
+    client = TestClient(create_api(GameController.new()))
+    claim = client.post(
+        "/control/red/claim", json=_command(request_id="claim-before-ws")
+    )
+    token = claim.json()["token"]
+    with client.websocket_connect("/ws") as socket:
+        socket.receive_json()
+        response = client.post(
+            "/record/import",
+            json=_command(
+                request_id="import-for-ws",
+                token=token,
+                expected_version=1,
+                path=str(text_path),
+                format="text",
+            ),
+        )
+        message = socket.receive_json()
+
+    assert response.status_code == 200, response.json()
+    assert message["type"] == "event"
+    assert message["event"]["kind"] == "record_loaded"
+    assert message["event"]["version"] == 2
+
+
+def test_request_id_is_global_across_controller_identities_and_claims() -> None:
+    client = TestClient(create_api(GameController.new()))
+    first = client.post(
+        "/control/red/claim",
+        json=_command(request_id="global-id", controller_id="remote-a"),
+    )
+    duplicate = client.post(
+        "/control/black/claim",
+        json=_command(
+            request_id="global-id",
+            controller_id="remote-b",
+            expected_version=1,
+        ),
+    )
+
+    assert first.status_code == 200
+    assert duplicate.status_code == 409
+    assert "request_id" in duplicate.json()["message"]
+
+
+def test_invalid_text_import_is_transactional_and_preserves_network_lease(
+    tmp_path,
+) -> None:
+    invalid_path = tmp_path / "invalid.moves"
+    invalid_path.write_text("这不是合法着法\n", encoding="utf-8")
+    client = TestClient(create_api(GameController.new()))
+    claim = client.post("/control/red/claim", json=_command(request_id="claim"))
+    token = claim.json()["token"]
+
+    failed = client.post(
+        "/record/import",
+        json=_command(
+            request_id="bad-import",
+            token=token,
+            expected_version=1,
+            path=str(invalid_path),
+            format="text",
+        ),
+    )
+
+    assert failed.status_code == 422
+    state = client.get("/state").json()
+    assert state["version"] == 1
+    assert state["ply"] == 0
+    assert state["controllers"]["red"] == {
+        "kind": "network",
+        "controller_id": "remote-1",
+    }
+    released = client.post(
+        "/control/red/release",
+        json=_command(
+            request_id="release-after-failure",
+            token=token,
+            expected_version=1,
+        ),
+    )
+    assert released.status_code == 200
+
+
+def test_websocket_rejects_request_id_already_used_by_http() -> None:
+    client = TestClient(create_api(GameController.new()))
+    claimed = client.post(
+        "/control/red/claim",
+        json=_command(request_id="cross-protocol-id", controller_id="http-client"),
+    )
+    assert claimed.status_code == 200
+
+    with client.websocket_connect("/ws") as socket:
+        socket.receive_json()
+        socket.send_json(
+            {
+                "command": "claim",
+                **_command(
+                    request_id="cross-protocol-id",
+                    controller_id="ws-client",
+                    expected_version=1,
+                    side="black",
+                ),
+            }
+        )
+        response = socket.receive_json()
+
+    assert response["type"] == "response"
+    assert response["ok"] is False
+    assert response["code"] == "invalid_command"
+    assert "request_id" in response["message"]
+
+
+def test_request_id_history_is_bounded_lru() -> None:
+    app = create_api(GameController.new(), request_history_size=2)
+    client = TestClient(app)
+    claim = client.post(
+        "/control/red/claim",
+        json=_command(request_id="oldest", controller_id="remote-a"),
+    )
+    token = claim.json()["token"]
+    for request_id in ("middle", "newest"):
+        failed = client.post(
+            "/undo",
+            json=_command(
+                request_id=request_id,
+                controller_id="remote-a",
+                token=token,
+                expected_version=1,
+            ),
+        )
+        assert failed.status_code == 409
+
+    assert list(app.state.processed_requests) == ["middle", "newest"]
+    reused_after_eviction = client.post(
+        "/control/black/claim",
+        json=_command(
+            request_id="oldest",
+            controller_id="remote-b",
+            expected_version=1,
+        ),
+    )
+    assert reused_after_eviction.status_code == 200
+
+
+def test_duplicate_request_refreshes_lru_recency() -> None:
+    app = create_api(GameController.new(), request_history_size=2)
+    client = TestClient(app)
+    oldest = client.post(
+        "/control/red/claim",
+        json=_command(request_id="oldest", controller_id="remote-a"),
+    )
+    red_token = oldest.json()["token"]
+    client.post(
+        "/control/black/claim",
+        json=_command(
+            request_id="middle",
+            controller_id="remote-b",
+            expected_version=1,
+        ),
+    )
+
+    touched = client.post(
+        "/undo",
+        json=_command(
+            request_id="oldest",
+            controller_id="remote-a",
+            token=red_token,
+            expected_version=2,
+        ),
+    )
+    client.post(
+        "/undo",
+        json=_command(
+            request_id="newest",
+            controller_id="remote-a",
+            token=red_token,
+            expected_version=2,
+        ),
+    )
+
+    assert touched.status_code == 409
+    assert list(app.state.processed_requests) == ["oldest", "newest"]
+
+
+def test_in_flight_request_id_cannot_be_evicted_by_concurrent_http_claim(
+    monkeypatch,
+) -> None:
+    controller = GameController.new()
+    original_claim = controller.claim_side
+    first_started = Event()
+    allow_first_to_finish = Event()
+    calls_lock = Lock()
+    slow_calls = 0
+
+    def delayed_claim(side, controller_id, *args, **kwargs):
+        nonlocal slow_calls
+        if controller_id == "slow-client":
+            with calls_lock:
+                slow_calls += 1
+                is_first = slow_calls == 1
+            if is_first:
+                first_started.set()
+                assert allow_first_to_finish.wait(timeout=5)
+        return original_claim(side, controller_id, *args, **kwargs)
+
+    monkeypatch.setattr(controller, "claim_side", delayed_claim)
+    client = TestClient(create_api(controller, request_history_size=1))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            client.post,
+            "/control/red/claim",
+            json=_command(request_id="in-flight", controller_id="slow-client"),
+        )
+        assert first_started.wait(timeout=5)
+        pressure = client.post(
+            "/control/black/claim",
+            json=_command(request_id="pressure", controller_id="other-client"),
+        )
+        duplicate = client.post(
+            "/control/red/claim",
+            json=_command(
+                request_id="in-flight",
+                controller_id="slow-client",
+                expected_version=1,
+            ),
+        )
+        allow_first_to_finish.set()
+        first.result(timeout=5)
+
+    assert pressure.status_code == 200
+    assert duplicate.status_code == 409
+    assert "重复 request_id" in duplicate.json()["message"]
+    assert slow_calls == 1
 
 
 def test_leased_identity_is_enforced_for_move_and_global_mutations(

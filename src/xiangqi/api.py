@@ -9,8 +9,8 @@ from __future__ import annotations
 import asyncio
 import queue
 import secrets
+from collections import OrderedDict
 from collections.abc import Mapping
-from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
 
@@ -28,9 +28,6 @@ from xiangqi.controller import (
     StaleVersionError,
 )
 from xiangqi.domain import Color, Coord
-from xiangqi.notation import replay_text
-from xiangqi.record import MoveRecord
-from xiangqi.rules import evaluate_position
 
 
 class ControllerHub:
@@ -162,9 +159,16 @@ def _result(value: Any) -> dict[str, Any] | None:
     return None if value is None else value.model_dump(mode="json")
 
 
-def _adjudication(value: Any) -> dict[str, Any] | None:
+def _adjudication(value: Any, *, ply: int) -> dict[str, Any] | None:
     if value is None:
         return None
+    related_moves = getattr(value, "related_moves", None)
+    if related_moves is None:
+        related_moves = (
+            tuple(range(value.cycle_start + 1, ply + 1))
+            if value.cycle_start is not None
+            else ()
+        )
     return {
         "kind": value.kind.value,
         "ruleset": value.ruleset.value,
@@ -173,6 +177,7 @@ def _adjudication(value: Any) -> dict[str, Any] | None:
         "responsible": (None if value.responsible is None else value.responsible.value),
         "move_natures": [nature.value for nature in value.move_natures],
         "responsible_natures": [nature.value for nature in value.responsible_natures],
+        "related_moves": list(related_moves),
         "rule_reference": value.rule_reference,
     }
 
@@ -209,7 +214,7 @@ def _state(state: ControllerState) -> dict[str, Any]:
         ),
         "replay_cursor": state.replay_cursor,
         "last_move": (None if state.last_move is None else state.last_move.to_dict()),
-        "adjudication": _adjudication(state.adjudication),
+        "adjudication": _adjudication(state.adjudication, ply=state.ply),
         "controllers": {
             side.value: {
                 "kind": control.kind.value,
@@ -231,7 +236,7 @@ def _event(event: GameEvent) -> dict[str, Any]:
         "in_check": event.in_check,
         "checkmate": event.checkmate,
         "stalemate": event.stalemate,
-        "adjudication": _adjudication(event.adjudication),
+        "adjudication": _adjudication(event.adjudication, ply=event.state.ply),
         "result": _result(event.result),
     }
 
@@ -367,10 +372,15 @@ def _authorize_identity(
 
 
 def create_api(
-    controller: GameController | ControllerHub, *, event_queue_size: int = 64
+    controller: GameController | ControllerHub,
+    *,
+    event_queue_size: int = 64,
+    request_history_size: int = 4096,
 ) -> FastAPI:
     """Create an unbound ASGI application around ``controller``."""
 
+    if request_history_size < 1:
+        raise ValueError("request_history_size 必须大于零")
     hub = (
         controller
         if isinstance(controller, ControllerHub)
@@ -384,16 +394,31 @@ def create_api(
     app.state.controller = controller
     app.state.controller_hub = hub
     app.state.event_broker = broker
-    processed_requests: set[tuple[str, str]] = set()
+    processed_requests: OrderedDict[str, None] = OrderedDict()
+    in_flight_requests: set[str] = set()
+    processed_request_limit = request_history_size
     request_lock = RLock()
+    app.state.processed_requests = processed_requests
+    app.state.in_flight_requests = in_flight_requests
+    app.state.processed_request_limit = processed_request_limit
 
     def execute_once(command: _Command, action: Any) -> dict[str, Any]:
-        key = (command.controller_id, command.request_id)
         with request_lock:
-            if key in processed_requests:
+            if command.request_id in in_flight_requests:
                 raise ControlError(f"重复 request_id: {command.request_id}")
-            processed_requests.add(key)
-        return action()
+            if command.request_id in processed_requests:
+                processed_requests.move_to_end(command.request_id)
+                raise ControlError(f"重复 request_id: {command.request_id}")
+            in_flight_requests.add(command.request_id)
+        try:
+            return action()
+        finally:
+            with request_lock:
+                in_flight_requests.remove(command.request_id)
+                processed_requests[command.request_id] = None
+                processed_requests.move_to_end(command.request_id)
+                if len(processed_requests) > processed_request_limit:
+                    processed_requests.popitem(last=False)
 
     def import_into_active(command: RecordImportCommand) -> dict[str, Any]:
         _authorize_identity(controller, command)
@@ -402,32 +427,12 @@ def create_api(
                 command.path, expected_version=command.expected_version
             )
             return _success(controller, event=event, request_id=command.request_id)
-        _verify_version(controller, command.expected_version)
-        text = Path(command.path).read_text(encoding="utf-8")
-        replayed = replay_text(text)
-        base = GameController.new().record
-        moves: list[MoveRecord] = []
-        before = GameController.new().get_state().board
-        side = Color.RED
-        for item in replayed.moves:
-            after = before.move_unchecked(item.move.start, item.move.end)
-            position = evaluate_position(after, side.opponent)
-            moves.append(
-                MoveRecord.from_move(
-                    item.move,
-                    notation=item.notation,
-                    position_after=item.position_after,
-                    in_check=position.in_check,
-                )
-            )
-            before = after
-            side = side.opponent
-        replacement = GameController.from_record(
-            base.model_copy(update={"moves": tuple(moves)})
+        event = controller.load_text_record(
+            command.path, expected_version=command.expected_version
         )
-        hub.replace(replacement)
         return _success(
             controller,
+            event=event,
             request_id=command.request_id,
             path=command.path,
         )

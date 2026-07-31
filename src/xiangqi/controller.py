@@ -23,7 +23,7 @@ from xiangqi.adjudication import (
 )
 from xiangqi.board import Board
 from xiangqi.domain import Color, Coord, Move, PositionKind, PositionResult
-from xiangqi.notation import format_move
+from xiangqi.notation import format_move, replay_text
 from xiangqi.record import (
     AdjudicationRecord,
     DrawEventRecord,
@@ -518,6 +518,53 @@ class GameController:
             self._check_version(expected_version)
             loaded = load_and_validate(path)
             replacement = GameController.from_record(loaded)
+            before = self.get_state().board
+            self._base_record = replacement._base_record
+            self._current = replacement._current
+            self._pending_draw = replacement._pending_draw
+            self._replay_cursor = None
+            return self._finish_event(GameEventKind.RECORD_LOADED, before_board=before)
+
+    def load_text_record(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        expected_version: int | None = None,
+    ) -> GameEvent:
+        """Transactionally load vertical-line notation into this controller."""
+        with self._lock:
+            self._check_version(expected_version)
+            text = Path(path).read_text(encoding="utf-8")
+            initial_board = Board.from_fen(self._base_record.initial_fen)
+            replayed = replay_text(
+                text,
+                initial_board=initial_board,
+                side_to_move=self._base_record.initial_side,
+            )
+            board = initial_board
+            side = self._base_record.initial_side
+            moves: list[MoveRecord] = []
+            for item in replayed.moves:
+                after = board.move_unchecked(item.move.start, item.move.end)
+                position = evaluate_position(after, side.opponent)
+                moves.append(
+                    MoveRecord.from_move(
+                        item.move,
+                        notation=item.notation,
+                        position_after=item.position_after,
+                        in_check=position.in_check,
+                    )
+                )
+                board = after
+                side = side.opponent
+            candidate = self._base_record.model_copy(
+                update={
+                    "moves": tuple(moves),
+                    "draw_events": (),
+                    "result": ResultRecord(status="ongoing"),
+                }
+            )
+            replacement = GameController.from_record(candidate)
             before = self.get_state().board
             self._base_record = replacement._base_record
             self._current = replacement._current
