@@ -235,7 +235,7 @@ def test_position_frame_classifies_unrooted_lesser_piece_as_chase() -> None:
 def test_a_genuinely_rooted_target_is_not_classified_as_chase() -> None:
     history = _rook_chase_history(rooted=True)
 
-    assert history[0].nature is MoveNature.IDLE
+    assert history[0].nature is MoveNature.FOLLOW
 
 
 def test_a_pinned_defender_is_only_a_fake_root() -> None:
@@ -251,7 +251,8 @@ def test_a_pinned_defender_is_only_a_fake_root() -> None:
 
     _, frame = _play(board, Color.RED, (0, 5), (1, 5))
 
-    assert frame.nature is MoveNature.CHASE
+    assert frame.nature is MoveNature.EXCHANGE
+    assert frame.attacks[0].rooted is False
 
 
 def test_a_pinned_attacker_does_not_create_a_fake_chase() -> None:
@@ -266,7 +267,7 @@ def test_a_pinned_attacker_does_not_create_a_fake_chase() -> None:
 
     _, frame = _play(board, Color.RED, (0, 7), (1, 5))
 
-    assert frame.nature is MoveNature.IDLE
+    assert frame.nature is MoveNature.SACRIFICE
     assert frame.attacks == ()
 
 
@@ -507,3 +508,160 @@ def test_frame_records_root_and_exchange_evidence() -> None:
     assert unrooted.attacks[0].target_value == 9
     assert unrooted.attacks[0].rooted is False
     assert rooted.attacks[0].rooted is True
+
+
+@pytest.mark.parametrize(
+    ("board", "start", "end", "expected_target"),
+    [
+        (
+            Board.empty()
+            .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+            .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+            .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+            .place(Coord(0, 7), _piece(Color.RED, PieceType.ROOK))
+            .place(Coord(3, 5), _piece(Color.RED, PieceType.ROOK))
+            .place(Coord(0, 3), _piece(Color.BLACK, PieceType.ROOK)),
+            (0, 7),
+            (0, 5),
+            Coord(0, 3),
+        ),
+        (
+            Board.empty()
+            .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+            .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+            .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+            .place(Coord(0, 7), _piece(Color.RED, PieceType.HORSE))
+            .place(Coord(1, 9), _piece(Color.RED, PieceType.ROOK))
+            .place(Coord(3, 4), _piece(Color.BLACK, PieceType.HORSE))
+            .place(Coord(3, 0), _piece(Color.BLACK, PieceType.ROOK)),
+            (0, 7),
+            (1, 5),
+            Coord(3, 4),
+        ),
+    ],
+)
+def test_real_transition_classifies_same_kind_invitation_as_exchange(
+    board: Board,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    expected_target: Coord,
+) -> None:
+    _, frame = _play(board, Color.RED, start, end)
+
+    assert frame.nature is MoveNature.EXCHANGE
+    assert frame.evidence.nature is MoveNature.EXCHANGE
+    assert expected_target in frame.evidence.targets
+
+
+@pytest.mark.parametrize(
+    ("board", "start", "end", "expected_attacker"),
+    [
+        (
+            Board.empty()
+            .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+            .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+            .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+            .place(Coord(0, 7), _piece(Color.RED, PieceType.HORSE))
+            .place(Coord(1, 0), _piece(Color.BLACK, PieceType.ROOK)),
+            (0, 7),
+            (1, 5),
+            Coord(1, 0),
+        ),
+        (
+            Board.empty()
+            .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+            .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+            .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+            .place(Coord(2, 9), _piece(Color.RED, PieceType.ELEPHANT))
+            .place(Coord(0, 0), _piece(Color.BLACK, PieceType.ROOK)),
+            (2, 9),
+            (0, 7),
+            Coord(0, 0),
+        ),
+    ],
+)
+def test_real_transition_classifies_unanswered_offer_as_sacrifice(
+    board: Board,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    expected_attacker: Coord,
+) -> None:
+    _, frame = _play(board, Color.RED, start, end)
+
+    assert frame.nature is MoveNature.SACRIFICE
+    assert frame.evidence.nature is MoveNature.SACRIFICE
+    assert expected_attacker in frame.evidence.actors
+
+
+@pytest.mark.parametrize(
+    ("board", "start", "end", "blocked_target"),
+    [
+        (
+            Board.empty()
+            .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+            .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+            .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+            .place(Coord(1, 6), _piece(Color.RED, PieceType.HORSE))
+            .place(Coord(0, 5), _piece(Color.RED, PieceType.ROOK))
+            .place(Coord(0, 0), _piece(Color.BLACK, PieceType.ROOK)),
+            (1, 6),
+            (0, 4),
+            Coord(0, 5),
+        ),
+        (
+            Board.empty()
+            .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+            .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+            .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+            .place(Coord(7, 6), _piece(Color.RED, PieceType.HORSE))
+            .place(Coord(8, 5), _piece(Color.RED, PieceType.ROOK))
+            .place(Coord(8, 0), _piece(Color.BLACK, PieceType.ROOK)),
+            (7, 6),
+            (8, 4),
+            Coord(8, 5),
+        ),
+    ],
+)
+def test_real_transition_classifies_non_attacking_interposition_as_block(
+    board: Board,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    blocked_target: Coord,
+) -> None:
+    _, frame = _play(board, Color.RED, start, end)
+
+    assert frame.nature is MoveNature.BLOCK
+    assert frame.evidence.nature is MoveNature.BLOCK
+    assert blocked_target in frame.evidence.targets
+
+
+@pytest.mark.parametrize(
+    "target_kind",
+    [PieceType.ROOK, PieceType.CANNON],
+)
+def test_real_transition_classifies_pressure_on_rooted_piece_as_follow(
+    target_kind: PieceType,
+) -> None:
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+        .place(Coord(0, 5), _piece(Color.RED, PieceType.ROOK))
+        .place(Coord(1, 3), _piece(Color.BLACK, target_kind))
+        .place(Coord(1, 0), _piece(Color.BLACK, PieceType.ROOK))
+    )
+
+    _, frame = _play(board, Color.RED, (0, 5), (1, 5))
+
+    assert frame.nature is MoveNature.FOLLOW
+    assert frame.evidence.nature is MoveNature.FOLLOW
+    assert Coord(1, 3) in frame.evidence.targets
+
+
+def test_aggressive_natures_keep_priority_over_permitted_move_natures() -> None:
+    assert _perpetual_check_history()[0].nature is MoveNature.CHECK
+    assert (
+        _rook_chase_history(target_kind=PieceType.CANNON)[0].nature
+        is MoveNature.CHASE
+    )

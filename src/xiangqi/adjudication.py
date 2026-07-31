@@ -79,6 +79,16 @@ class TacticalAttack:
     rooted: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ClassificationEvidence:
+    """Auditable board coordinates supporting a move-nature classification."""
+
+    nature: MoveNature
+    actors: tuple[Coord, ...] = ()
+    targets: tuple[Coord, ...] = ()
+    rationale: str = ""
+
+
 def _legal_capture_pairs(board: Board, side: Color) -> set[tuple[Coord, Coord]]:
     """Return legal attacker/target pairs, excluding empty destinations."""
     pairs: set[tuple[Coord, Coord]] = set()
@@ -123,6 +133,68 @@ def _new_attacks(
     return tuple(attacks)
 
 
+def _exchange_targets(
+    board_after: Board, side: Color, move: Move, attacks: Sequence[TacticalAttack]
+) -> tuple[Coord, ...]:
+    """Same-kind, mutually capturable contacts are invitations to exchange."""
+    opponent_captures = _legal_capture_pairs(board_after, side.opponent)
+    targets: list[Coord] = []
+    for attack in attacks:
+        if (
+            attack.attacker != move.end
+            or attack.attacker_piece.kind is not attack.target_piece.kind
+            or (attack.target, move.end) not in opponent_captures
+        ):
+            continue
+        accepted = board_after.move_unchecked(attack.target, move.end)
+        if any(
+            candidate.end == move.end
+            for candidate in all_legal_moves(accepted, side)
+        ):
+            targets.append(attack.target)
+    return tuple(targets)
+
+
+def _blocked_targets(
+    board_before: Board, board_after: Board, side: Color, move: Move
+) -> tuple[Coord, ...]:
+    """Targets whose opponent capture was stopped by the moved interposer."""
+    before = _legal_capture_pairs(board_before, side.opponent)
+    after = _legal_capture_pairs(board_after, side.opponent)
+    return tuple(
+        sorted(
+            {
+                target
+                for attacker, target in before - after
+                if target != move.start
+                and board_after.at(attacker) is not None
+                and board_after.at(target) is not None
+            },
+            key=lambda coord: (coord.rank, coord.file),
+        )
+    )
+
+
+def _sacrifice_attackers(
+    board_before: Board, board_after: Board, side: Color, move: Move
+) -> tuple[Coord, ...]:
+    """Opponent pieces which may legally accept the newly offered moved piece."""
+    before = _legal_capture_pairs(board_before, side.opponent)
+    return tuple(
+        sorted(
+            (
+                attacker
+                for attacker, target in _legal_capture_pairs(
+                    board_after, side.opponent
+                )
+                if target == move.end
+                and (attacker, move.start) not in before
+            ),
+            key=lambda coord: (coord.rank, coord.file),
+        )
+    )
+
+
 def _has_forced_mate_next_move(board: Board, attacker: Color) -> bool:
     """Two-ply kill: every legal defence still permits an immediate mate."""
     defender = attacker.opponent
@@ -155,6 +227,7 @@ class PositionFrame:
     after_key: str
     nature: MoveNature
     attacks: tuple[TacticalAttack, ...] = ()
+    evidence: ClassificationEvidence = ClassificationEvidence(MoveNature.IDLE)
 
     @classmethod
     def from_transition(
@@ -180,18 +253,80 @@ class PositionFrame:
             raise ValueError("走后局面不是所给着法的结果")
 
         attacks = _new_attacks(board_before, board_after, side, move)
+        exchange_targets = _exchange_targets(board_after, side, move, attacks)
+        blocked_targets = _blocked_targets(board_before, board_after, side, move)
+        sacrifice_attackers = _sacrifice_attackers(
+            board_before, board_after, side, move
+        )
+        followed_targets = tuple(
+            attack.target for attack in attacks if attack.rooted
+        )
         if is_in_check(board_after, side.opponent):
             nature = MoveNature.CHECK
+            evidence = ClassificationEvidence(
+                nature, actors=(move.end,), rationale="走后直接攻击对方将帅"
+            )
         elif analyze_kill and _has_forced_mate_next_move(board_after, side):
             nature = MoveNature.KILL
+            evidence = ClassificationEvidence(
+                nature, actors=(move.end,), rationale="对方所有应着后均存在一步将死"
+            )
+        elif exchange_targets:
+            nature = MoveNature.EXCHANGE
+            evidence = ClassificationEvidence(
+                nature,
+                actors=(move.end,),
+                targets=exchange_targets,
+                rationale="同兵种互相可吃，形成邀兑",
+            )
         elif any(
             attack.attacker_piece.kind not in (PieceType.GENERAL, PieceType.PAWN)
             and (not attack.rooted or attack.target_value > attack.attacker_value)
             for attack in attacks
         ):
             nature = MoveNature.CHASE
+            evidence = ClassificationEvidence(
+                nature,
+                actors=tuple(dict.fromkeys(a.attacker for a in attacks)),
+                targets=tuple(
+                    attack.target
+                    for attack in attacks
+                    if attack.attacker_piece.kind
+                    not in (PieceType.GENERAL, PieceType.PAWN)
+                    and (
+                        not attack.rooted
+                        or attack.target_value > attack.attacker_value
+                    )
+                ),
+                rationale="产生可得子的新增合法攻击",
+            )
+        elif blocked_targets:
+            nature = MoveNature.BLOCK
+            evidence = ClassificationEvidence(
+                nature,
+                actors=(move.end,),
+                targets=blocked_targets,
+                rationale="走子阻断对方原有合法吃子线路",
+            )
+        elif followed_targets:
+            nature = MoveNature.FOLLOW
+            evidence = ClassificationEvidence(
+                nature,
+                actors=tuple(dict.fromkeys(a.attacker for a in attacks)),
+                targets=followed_targets,
+                rationale="新增盯牵有根子但不构成得子",
+            )
+        elif sacrifice_attackers:
+            nature = MoveNature.SACRIFICE
+            evidence = ClassificationEvidence(
+                nature,
+                actors=sacrifice_attackers,
+                targets=(move.end,),
+                rationale="所走棋子进入对方合法吃子范围",
+            )
         else:
             nature = MoveNature.IDLE
+            evidence = ClassificationEvidence(nature, rationale="未形成将杀捉兑献拦跟")
         return cls(
             board_before=board_before,
             board_after=board_after,
@@ -201,6 +336,7 @@ class PositionFrame:
             after_key=board_after.position_key(side.opponent),
             nature=nature,
             attacks=attacks,
+            evidence=evidence,
         )
 
 
@@ -270,6 +406,7 @@ def _validate_history(history: Sequence[PositionFrame]) -> None:
             or frame.after_key != rebuilt.after_key
             or frame.nature is not rebuilt.nature
             or frame.attacks != rebuilt.attacks
+            or frame.evidence != rebuilt.evidence
         ):
             raise ValueError("棋史中的着法性质或局面摘要与实际转换不一致")
         if previous is not None:
