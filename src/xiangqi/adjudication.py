@@ -555,6 +555,13 @@ _CHASE_WITHOUT_CHECK_PATTERNS = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _CycleProfile:
+    pattern: _CyclePattern
+    target_kinds: frozenset[PieceType] = frozenset()
+    targets_unrooted: bool = False
+
+
 def _cycle_pattern(natures: Sequence[MoveNature]) -> _CyclePattern:
     """Map every nature combination to one named, auditable table row."""
     attacks = frozenset(natures)
@@ -565,26 +572,40 @@ def _cycle_pattern(natures: Sequence[MoveNature]) -> _CyclePattern:
     return _PATTERN_BY_ATTACKS[attacks]
 
 
-def _cycle_pattern_with_evidence(
+def _cycle_profile_with_evidence(
     frames: Sequence[PositionFrame], natures: Sequence[MoveNature]
-) -> _CyclePattern:
+) -> _CycleProfile:
     """Refine long chase into the 26.9 joint-chase table row from attack evidence."""
     pattern = _cycle_pattern(natures)
     if pattern is not _CyclePattern.CHASE:
-        return pattern
+        return _CycleProfile(pattern)
     chase_frames = tuple(
         frame for frame, nature in zip(frames, natures, strict=True)
         if nature is MoveNature.CHASE
     )
-    if chase_frames and all(
+    relevant = tuple(attack for frame in chase_frames for attack in frame.attacks)
+    target_kinds = frozenset(attack.target_piece.kind for attack in relevant)
+    targets_unrooted = any(not attack.rooted for attack in relevant)
+    joint = bool(chase_frames) and all(
         any(
-            sum(attack.target == target for attack in frame.attacks) >= 2
+            len(target_attacks) >= 2
+            and all(attack.rooted for attack in target_attacks)
             for target in {attack.target for attack in frame.attacks}
+            if (
+                target_attacks := tuple(
+                    attack
+                    for attack in frame.attacks
+                    if attack.target == target
+                )
+            )
         )
         for frame in chase_frames
-    ):
-        return _CyclePattern.JOINT_CHASE
-    return pattern
+    )
+    return _CycleProfile(
+        _CyclePattern.JOINT_CHASE if joint else pattern,
+        target_kinds,
+        targets_unrooted,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -596,14 +617,14 @@ class _TableDecision:
 
 
 def _single_or_allowed_decision(
-    patterns: Mapping[Color, _CyclePattern],
+    profiles: Mapping[Color, _CycleProfile],
     *,
     ruleset: Ruleset,
 ) -> _TableDecision | None:
     prohibited = tuple(
         color
-        for color, pattern in patterns.items()
-        if pattern is not _CyclePattern.ALLOWED
+        for color, profile in profiles.items()
+        if profile.pattern is not _CyclePattern.ALLOWED
     )
     if not prohibited:
         reference = (
@@ -619,7 +640,7 @@ def _single_or_allowed_decision(
         )
     if len(prohibited) == 1:
         responsible = prohibited[0]
-        pattern = patterns[responsible]
+        pattern = profiles[responsible].pattern
         pattern_label = {
             _CyclePattern.CHECK: "长将",
             _CyclePattern.KILL: "长杀",
@@ -652,10 +673,12 @@ def _single_or_allowed_decision(
 
 
 def _chinese_bilateral_decision(
-    patterns: Mapping[Color, _CyclePattern],
+    profiles: Mapping[Color, _CycleProfile],
 ) -> _TableDecision:
-    red = patterns[Color.RED]
-    black = patterns[Color.BLACK]
+    red_profile = profiles[Color.RED]
+    black_profile = profiles[Color.BLACK]
+    red = red_profile.pattern
+    black = black_profile.pattern
     if (red in _CHECK_PATTERNS) != (black in _CHECK_PATTERNS):
         responsible = Color.RED if red in _CHECK_PATTERNS else Color.BLACK
         return _TableDecision(
@@ -677,16 +700,22 @@ def _chinese_bilateral_decision(
             "双方均有禁止着法，长杀或杀捉组合方须变着",
         )
     if {red, black} == {_CyclePattern.CHASE, _CyclePattern.JOINT_CHASE}:
-        responsible = (
-            Color.RED if red is _CyclePattern.CHASE else Color.BLACK
-        )
-        return _TableDecision(
-            AdjudicationKind.MUST_CHANGE,
-            responsible,
-            "中国棋规2020 表项26.9.2至26.9.3"
-            "（长捉车或无根子相对联合捉）",
-            "单子长捉车或无根子的一方相对联合捉方须变着",
-        )
+        responsible = Color.RED if red is _CyclePattern.CHASE else Color.BLACK
+        ordinary = profiles[responsible]
+        if PieceType.ROOK in ordinary.target_kinds:
+            return _TableDecision(
+                AdjudicationKind.MUST_CHANGE,
+                responsible,
+                "中国棋规2020 表项26.9.2（长捉车相对联合捉车）",
+                "单子长捉车的一方相对联合捉车方须变着",
+            )
+        if ordinary.targets_unrooted:
+            return _TableDecision(
+                AdjudicationKind.MUST_CHANGE,
+                responsible,
+                "中国棋规2020 表项26.9.3（长捉无根子相对联合捉）",
+                "单子长捉无根子的一方相对联合捉方须变着",
+            )
     return _TableDecision(
         AdjudicationKind.DRAW,
         None,
@@ -696,10 +725,10 @@ def _chinese_bilateral_decision(
 
 
 def _asian_bilateral_decision(
-    patterns: Mapping[Color, _CyclePattern],
+    profiles: Mapping[Color, _CycleProfile],
 ) -> _TableDecision:
-    red = patterns[Color.RED]
-    black = patterns[Color.BLACK]
+    red = profiles[Color.RED].pattern
+    black = profiles[Color.BLACK].pattern
     if (red in _CHECK_PATTERNS) != (black in _CHECK_PATTERNS):
         responsible = Color.RED if red in _CHECK_PATTERNS else Color.BLACK
     elif (
@@ -730,26 +759,26 @@ def _evaluate_responsibility(
     reference: str,
     cycle_start: int | None,
     ordered_natures: Sequence[MoveNature] | None = None,
-    patterns_override: Mapping[Color, _CyclePattern] | None = None,
+    profiles_override: Mapping[Color, _CycleProfile] | None = None,
 ) -> Adjudication:
     """Apply the formal responsibility table after tactical classification."""
     normalized = {color: tuple(by_side.get(color, ())) for color in Color}
     if not all(normalized.values()):
         raise ValueError("双方均须提供循环中的着法性质")
-    patterns = (
-        dict(patterns_override)
-        if patterns_override is not None
+    profiles = (
+        dict(profiles_override)
+        if profiles_override is not None
         else {
-            color: _cycle_pattern(natures)
+            color: _CycleProfile(_cycle_pattern(natures))
             for color, natures in normalized.items()
         }
     )
-    decision = _single_or_allowed_decision(patterns, ruleset=ruleset)
+    decision = _single_or_allowed_decision(profiles, ruleset=ruleset)
     if decision is None:
         decision = (
-            _chinese_bilateral_decision(patterns)
+            _chinese_bilateral_decision(profiles)
             if ruleset is Ruleset.CHINESE_2020
-            else _asian_bilateral_decision(patterns)
+            else _asian_bilateral_decision(profiles)
         )
     return _make_result(
         by_side=normalized,
@@ -813,8 +842,8 @@ class Chinese2020Adjudicator(_AdjudicatorBase):
 
     def _evaluate_cycle(self, cycle: _Cycle) -> Adjudication:
         effective = _effective_cycle_natures(cycle)
-        patterns = {
-            color: _cycle_pattern_with_evidence(
+        profiles = {
+            color: _cycle_profile_with_evidence(
                 tuple(frame for frame in cycle.frames if frame.side is color),
                 tuple(
                     nature
@@ -832,7 +861,7 @@ class Chinese2020Adjudicator(_AdjudicatorBase):
             self._reference,
             cycle.start,
             effective,
-            patterns,
+            profiles,
         )
 
 
@@ -849,8 +878,8 @@ class Asian2003Adjudicator(_AdjudicatorBase):
 
     def _evaluate_cycle(self, cycle: _Cycle) -> Adjudication:
         effective = _effective_cycle_natures(cycle)
-        patterns = {
-            color: _cycle_pattern_with_evidence(
+        profiles = {
+            color: _cycle_profile_with_evidence(
                 tuple(frame for frame in cycle.frames if frame.side is color),
                 tuple(
                     nature
@@ -868,5 +897,5 @@ class Asian2003Adjudicator(_AdjudicatorBase):
             self._reference,
             cycle.start,
             effective,
-            patterns,
+            profiles,
         )

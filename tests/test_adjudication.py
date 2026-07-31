@@ -508,35 +508,104 @@ def test_rulesets_explicitly_reverse_kill_versus_chase_priority() -> None:
     assert "Table 4-C" in asian.rule_reference
 
 
-def test_real_joint_attack_evidence_selects_joint_chase_table_row() -> None:
+def _two_attackers_frame(
+    *, target_kind: PieceType, rooted: bool
+) -> PositionFrame:
     board = (
         Board.empty()
         .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
         .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
         .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
-        .place(Coord(0, 3), _piece(Color.RED, PieceType.ROOK))
-        .place(Coord(1, 3), _piece(Color.RED, PieceType.HORSE))
-        .place(Coord(3, 3), _piece(Color.BLACK, PieceType.ROOK))
+        .place(Coord(1, 2), _piece(Color.RED, PieceType.HORSE))
+        .place(Coord(2, 2), _piece(Color.RED, PieceType.ROOK))
+        .place(Coord(3, 3), _piece(Color.BLACK, target_kind))
     )
-    _, frame = _play(board, Color.RED, (1, 3), (2, 5))
+    if rooted:
+        board = board.place(
+            Coord(5, 4), _piece(Color.BLACK, PieceType.HORSE)
+        )
+    _, frame = _play(board, Color.RED, (2, 2), (3, 2))
+    return frame
 
+
+def _single_attacker_frame(
+    *, target_kind: PieceType, rooted: bool
+) -> PositionFrame:
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+        .place(Coord(0, 7), _piece(Color.RED, PieceType.HORSE))
+        .place(Coord(3, 4), _piece(Color.BLACK, target_kind))
+    )
+    if rooted:
+        board = board.place(
+            Coord(3, 0), _piece(Color.BLACK, PieceType.ROOK)
+        )
+    _, frame = _play(board, Color.RED, (0, 7), (1, 5))
+    return frame
+
+
+def test_two_independent_attacks_on_unrooted_target_are_not_joint_chase() -> None:
+    frame = _two_attackers_frame(target_kind=PieceType.ROOK, rooted=False)
     assert frame.nature is MoveNature.CHASE
     assert [attack.target for attack in frame.attacks].count(Coord(3, 3)) == 2
-    pattern = adjudication_module._cycle_pattern_with_evidence(
+    profile = adjudication_module._cycle_profile_with_evidence(
         (frame,), (MoveNature.CHASE,)
     )
-    assert pattern.value == "joint_chase"
+    assert profile.pattern.value == "chase"
+    assert profile.targets_unrooted is True
 
 
-def test_chinese_strong_chase_must_change_against_joint_chase() -> None:
-    pattern = adjudication_module._CyclePattern
-    decision = adjudication_module._chinese_bilateral_decision(
-        {Color.RED: pattern.CHASE, Color.BLACK: pattern.JOINT_CHASE}
+def test_rooted_target_requiring_both_new_attackers_is_joint_chase() -> None:
+    frame = _two_attackers_frame(target_kind=PieceType.ROOK, rooted=True)
+
+    profile = adjudication_module._cycle_profile_with_evidence(
+        (frame,), (MoveNature.CHASE,)
     )
 
-    assert decision.kind is AdjudicationKind.MUST_CHANGE
-    assert decision.responsible is Color.RED
-    assert "26.9.2" in decision.reference
+    assert profile.pattern.value == "joint_chase"
+    assert profile.target_kinds == frozenset({PieceType.ROOK})
+
+
+@pytest.mark.parametrize(
+    ("ordinary_kind", "ordinary_rooted", "responsible", "reference"),
+    [
+        (PieceType.ROOK, True, Color.RED, "26.9.2"),
+        (PieceType.CANNON, False, Color.RED, "26.9.3"),
+        (PieceType.CANNON, True, None, "26.9.4"),
+    ],
+)
+def test_chinese_ordinary_chase_versus_joint_chase_uses_target_evidence(
+    ordinary_kind: PieceType,
+    ordinary_rooted: bool,
+    responsible: Color | None,
+    reference: str,
+) -> None:
+    ordinary_frame = _single_attacker_frame(
+        target_kind=ordinary_kind, rooted=ordinary_rooted
+    )
+    joint_frame = _two_attackers_frame(
+        target_kind=ordinary_kind, rooted=True
+    )
+    red_profile = adjudication_module._cycle_profile_with_evidence(
+        (ordinary_frame,), (MoveNature.CHASE,)
+    )
+    black_profile = adjudication_module._cycle_profile_with_evidence(
+        (joint_frame,), (MoveNature.CHASE,)
+    )
+    decision = adjudication_module._chinese_bilateral_decision(
+        {Color.RED: red_profile, Color.BLACK: black_profile}
+    )
+
+    assert decision.responsible is responsible
+    assert decision.kind is (
+        AdjudicationKind.DRAW
+        if responsible is None
+        else AdjudicationKind.MUST_CHANGE
+    )
+    assert reference in decision.reference
 
 
 def test_fourth_unchanged_cycle_keeps_explicit_loss_evidence() -> None:
