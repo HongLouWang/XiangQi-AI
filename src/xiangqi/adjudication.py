@@ -279,11 +279,7 @@ class PositionFrame:
                 targets=exchange_targets,
                 rationale="同兵种互相可吃，形成邀兑",
             )
-        elif any(
-            attack.attacker_piece.kind not in (PieceType.GENERAL, PieceType.PAWN)
-            and (not attack.rooted or attack.target_value > attack.attacker_value)
-            for attack in attacks
-        ):
+        elif any(_qualifies_as_chase(attack) for attack in attacks):
             nature = MoveNature.CHASE
             evidence = ClassificationEvidence(
                 nature,
@@ -291,12 +287,7 @@ class PositionFrame:
                 targets=tuple(
                     attack.target
                     for attack in attacks
-                    if attack.attacker_piece.kind
-                    not in (PieceType.GENERAL, PieceType.PAWN)
-                    and (
-                        not attack.rooted
-                        or attack.target_value > attack.attacker_value
-                    )
+                    if _qualifies_as_chase(attack)
                 ),
                 rationale="产生可得子的新增合法攻击",
             )
@@ -559,7 +550,16 @@ _CHASE_WITHOUT_CHECK_PATTERNS = frozenset(
 class _CycleProfile:
     pattern: _CyclePattern
     target_kinds: frozenset[PieceType] = frozenset()
-    targets_unrooted: bool = False
+    every_chase_frame_targets_rook: bool = False
+    every_chase_frame_targets_unrooted: bool = False
+
+
+def _qualifies_as_chase(attack: TacticalAttack) -> bool:
+    return (
+        attack.attacker_piece.kind
+        not in (PieceType.GENERAL, PieceType.PAWN)
+        and (not attack.rooted or attack.target_value > attack.attacker_value)
+    )
 
 
 def _cycle_pattern(natures: Sequence[MoveNature]) -> _CyclePattern:
@@ -583,28 +583,45 @@ def _cycle_profile_with_evidence(
         frame for frame, nature in zip(frames, natures, strict=True)
         if nature is MoveNature.CHASE
     )
-    relevant = tuple(attack for frame in chase_frames for attack in frame.attacks)
+    qualifying_by_frame = tuple(
+        tuple(attack for attack in frame.attacks if _qualifies_as_chase(attack))
+        for frame in chase_frames
+    )
+    relevant = tuple(
+        attack for attacks in qualifying_by_frame for attack in attacks
+    )
     target_kinds = frozenset(attack.target_piece.kind for attack in relevant)
-    targets_unrooted = any(not attack.rooted for attack in relevant)
+    every_rook = bool(qualifying_by_frame) and all(
+        attacks
+        and all(
+            attack.target_piece.kind is PieceType.ROOK for attack in attacks
+        )
+        for attacks in qualifying_by_frame
+    )
+    every_unrooted = bool(qualifying_by_frame) and all(
+        attacks and all(not attack.rooted for attack in attacks)
+        for attacks in qualifying_by_frame
+    )
     joint = bool(chase_frames) and all(
         any(
             len(target_attacks) >= 2
             and all(attack.rooted for attack in target_attacks)
-            for target in {attack.target for attack in frame.attacks}
+            for target in {attack.target for attack in attacks}
             if (
                 target_attacks := tuple(
                     attack
-                    for attack in frame.attacks
+                    for attack in attacks
                     if attack.target == target
                 )
             )
         )
-        for frame in chase_frames
+        for attacks in qualifying_by_frame
     )
     return _CycleProfile(
         _CyclePattern.JOINT_CHASE if joint else pattern,
         target_kinds,
-        targets_unrooted,
+        every_rook,
+        every_unrooted,
     )
 
 
@@ -702,14 +719,21 @@ def _chinese_bilateral_decision(
     if {red, black} == {_CyclePattern.CHASE, _CyclePattern.JOINT_CHASE}:
         responsible = Color.RED if red is _CyclePattern.CHASE else Color.BLACK
         ordinary = profiles[responsible]
-        if PieceType.ROOK in ordinary.target_kinds:
+        joint_profile = profiles[responsible.opponent]
+        if (
+            ordinary.every_chase_frame_targets_rook
+            and joint_profile.every_chase_frame_targets_rook
+        ):
             return _TableDecision(
                 AdjudicationKind.MUST_CHANGE,
                 responsible,
                 "中国棋规2020 表项26.9.2（长捉车相对联合捉车）",
                 "单子长捉车的一方相对联合捉车方须变着",
             )
-        if ordinary.targets_unrooted:
+        if (
+            ordinary.every_chase_frame_targets_unrooted
+            and joint_profile.every_chase_frame_targets_unrooted
+        ):
             return _TableDecision(
                 AdjudicationKind.MUST_CHANGE,
                 responsible,
