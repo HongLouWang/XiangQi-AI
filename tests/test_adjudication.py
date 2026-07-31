@@ -747,6 +747,40 @@ def test_2693_requires_both_profiles_to_mark_every_frame_unrooted() -> None:
     assert "26.9.3" in decision.reference
 
 
+def test_real_threefold_joint_unrooted_chase_reaches_2693_end_to_end() -> None:
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(3, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(0, 5), _piece(Color.RED, PieceType.ROOK))
+        .place(Coord(4, 6), _piece(Color.RED, PieceType.ROOK))
+        .place(Coord(0, 7), _piece(Color.RED, PieceType.CANNON))
+        .place(Coord(1, 7), _piece(Color.RED, PieceType.CANNON))
+        .place(Coord(1, 3), _piece(Color.BLACK, PieceType.ROOK))
+        .place(Coord(4, 3), _piece(Color.BLACK, PieceType.ROOK))
+    )
+    history: list[PositionFrame] = []
+    side = Color.RED
+    cycle = (
+        ((0, 5), (1, 5)),
+        ((1, 3), (0, 3)),
+        ((1, 5), (0, 5)),
+        ((0, 3), (1, 3)),
+    )
+    for _ in range(2):
+        for start, end in cycle:
+            board, frame = _play(board, side, start, end)
+            history.append(frame)
+            side = side.opponent
+
+    result = Chinese2020Adjudicator().evaluate(history)
+
+    assert all(frame.nature is MoveNature.CHASE for frame in history)
+    assert result.kind is AdjudicationKind.MUST_CHANGE
+    assert result.responsible is Color.BLACK
+    assert "26.9.3" in result.rule_reference
+
+
 def test_fourth_unchanged_cycle_keeps_explicit_loss_evidence() -> None:
     adjudicator = Chinese2020Adjudicator()
     must_change = adjudicator.evaluate(_perpetual_check_history())

@@ -562,6 +562,45 @@ def _qualifies_as_chase(attack: TacticalAttack) -> bool:
     )
 
 
+def _has_indispensable_support(
+    frame: PositionFrame, attack: TacticalAttack
+) -> bool:
+    """Counterfactually prove that another friendly piece enables this chase."""
+    for supporter, piece in frame.board_after.pieces.items():
+        if (
+            piece.color is not frame.side
+            or piece.kind is PieceType.GENERAL
+            or supporter == attack.attacker
+        ):
+            continue
+        without_support = frame.board_after.remove(supporter)
+        if is_in_check(without_support, frame.side):
+            # Removing a shield of one's own general is not evidence that the
+            # piece participates in capturing the target.
+            continue
+        if (attack.attacker, attack.target) not in _legal_capture_pairs(
+            without_support, frame.side
+        ):
+            return True
+        revised = TacticalAttack(
+            attacker=attack.attacker,
+            attacker_piece=attack.attacker_piece,
+            target=attack.target,
+            target_piece=attack.target_piece,
+            attacker_value=attack.attacker_value,
+            target_value=attack.target_value,
+            rooted=_capture_is_rooted(
+                without_support,
+                attack.attacker,
+                attack.target,
+                frame.side,
+            ),
+        )
+        if not _qualifies_as_chase(revised):
+            return True
+    return False
+
+
 def _cycle_pattern(natures: Sequence[MoveNature]) -> _CyclePattern:
     """Map every nature combination to one named, auditable table row."""
     attacks = frozenset(natures)
@@ -603,7 +642,8 @@ def _cycle_profile_with_evidence(
         for attacks in qualifying_by_frame
     )
     joint = bool(chase_frames) and all(
-        any(
+        any(_has_indispensable_support(frame, attack) for attack in attacks)
+        or any(
             len(target_attacks) >= 2
             and all(attack.rooted for attack in target_attacks)
             for target in {attack.target for attack in attacks}
@@ -615,7 +655,9 @@ def _cycle_profile_with_evidence(
                 )
             )
         )
-        for attacks in qualifying_by_frame
+        for frame, attacks in zip(
+            chase_frames, qualifying_by_frame, strict=True
+        )
     )
     return _CycleProfile(
         _CyclePattern.JOINT_CHASE if joint else pattern,
