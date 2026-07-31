@@ -512,23 +512,216 @@ def _make_result(
     )
 
 
-def _chinese_responsibility(natures: Sequence[MoveNature]) -> int:
-    """2020 rules: every all-aggressive check/kill/chase cycle is prohibited."""
-    if not natures or any(
-        nature not in {MoveNature.CHECK, MoveNature.KILL, MoveNature.CHASE}
-        for nature in natures
+class _CyclePattern(StrEnum):
+    ALLOWED = "allowed"
+    CHECK = "check"
+    KILL = "kill"
+    CHASE = "chase"
+    CHECK_KILL = "check_kill"
+    CHECK_CHASE = "check_chase"
+    KILL_CHASE = "kill_chase"
+    CHECK_KILL_CHASE = "check_kill_chase"
+    JOINT_CHASE = "joint_chase"
+
+
+_PATTERN_BY_ATTACKS = {
+    frozenset({MoveNature.CHECK}): _CyclePattern.CHECK,
+    frozenset({MoveNature.KILL}): _CyclePattern.KILL,
+    frozenset({MoveNature.CHASE}): _CyclePattern.CHASE,
+    frozenset({MoveNature.CHECK, MoveNature.KILL}): _CyclePattern.CHECK_KILL,
+    frozenset({MoveNature.CHECK, MoveNature.CHASE}): _CyclePattern.CHECK_CHASE,
+    frozenset({MoveNature.KILL, MoveNature.CHASE}): _CyclePattern.KILL_CHASE,
+    frozenset(
+        {MoveNature.CHECK, MoveNature.KILL, MoveNature.CHASE}
+    ): _CyclePattern.CHECK_KILL_CHASE,
+}
+_CHECK_PATTERNS = frozenset(
+    {
+        _CyclePattern.CHECK,
+        _CyclePattern.CHECK_KILL,
+        _CyclePattern.CHECK_CHASE,
+        _CyclePattern.CHECK_KILL_CHASE,
+    }
+)
+_KILL_WITHOUT_CHECK_PATTERNS = frozenset(
+    {_CyclePattern.KILL, _CyclePattern.KILL_CHASE}
+)
+_CHASE_WITHOUT_CHECK_PATTERNS = frozenset(
+    {
+        _CyclePattern.CHASE,
+        _CyclePattern.JOINT_CHASE,
+        _CyclePattern.KILL_CHASE,
+    }
+)
+
+
+def _cycle_pattern(natures: Sequence[MoveNature]) -> _CyclePattern:
+    """Map every nature combination to one named, auditable table row."""
+    attacks = frozenset(natures)
+    if not natures or not attacks.issubset(
+        {MoveNature.CHECK, MoveNature.KILL, MoveNature.CHASE}
     ):
-        return 0
-    return 2 if MoveNature.CHECK in natures else 1
+        return _CyclePattern.ALLOWED
+    return _PATTERN_BY_ATTACKS[attacks]
 
 
-def _asian_responsibility(natures: Sequence[MoveNature]) -> int:
-    """2003 rules: long check/chase are prohibited; mixed attacks and kills draw."""
-    if natures and all(nature is MoveNature.CHECK for nature in natures):
-        return 2
-    if natures and all(nature is MoveNature.CHASE for nature in natures):
-        return 1
-    return 0
+def _cycle_pattern_with_evidence(
+    frames: Sequence[PositionFrame], natures: Sequence[MoveNature]
+) -> _CyclePattern:
+    """Refine long chase into the 26.9 joint-chase table row from attack evidence."""
+    pattern = _cycle_pattern(natures)
+    if pattern is not _CyclePattern.CHASE:
+        return pattern
+    chase_frames = tuple(
+        frame for frame, nature in zip(frames, natures, strict=True)
+        if nature is MoveNature.CHASE
+    )
+    if chase_frames and all(
+        any(
+            sum(attack.target == target for attack in frame.attacks) >= 2
+            for target in {attack.target for attack in frame.attacks}
+        )
+        for frame in chase_frames
+    ):
+        return _CyclePattern.JOINT_CHASE
+    return pattern
+
+
+@dataclass(frozen=True, slots=True)
+class _TableDecision:
+    kind: AdjudicationKind
+    responsible: Color | None
+    reference: str
+    reason: str
+
+
+def _single_or_allowed_decision(
+    patterns: Mapping[Color, _CyclePattern],
+    *,
+    ruleset: Ruleset,
+) -> _TableDecision | None:
+    prohibited = tuple(
+        color
+        for color, pattern in patterns.items()
+        if pattern is not _CyclePattern.ALLOWED
+    )
+    if not prohibited:
+        reference = (
+            "中国棋规2020 表项25.2、24.8（兑献拦跟均属闲）"
+            if ruleset is Ruleset.CHINESE_2020
+            else "AXF 2003 Chapter 4 Table 4-B (both sides permitted/idle)"
+        )
+        return _TableDecision(
+            AdjudicationKind.DRAW,
+            None,
+            reference,
+            "双方循环均为允许着法或闲着，双方不变判和",
+        )
+    if len(prohibited) == 1:
+        responsible = prohibited[0]
+        pattern = patterns[responsible]
+        pattern_label = {
+            _CyclePattern.CHECK: "长将",
+            _CyclePattern.KILL: "长杀",
+            _CyclePattern.CHASE: "长捉",
+            _CyclePattern.CHECK_KILL: "一将一杀",
+            _CyclePattern.CHECK_CHASE: "一将一捉",
+            _CyclePattern.KILL_CHASE: "一杀一捉",
+            _CyclePattern.CHECK_KILL_CHASE: "将杀捉组合",
+            _CyclePattern.JOINT_CHASE: "联合长捉",
+        }[pattern]
+        reference = (
+            (
+                "中国棋规2020 表项25.1、24.13（单方长将或将类组合）"
+                if pattern in _CHECK_PATTERNS
+                else "中国棋规2020 表项25.3、24.13（单方禁止着法）"
+            )
+            if ruleset is Ruleset.CHINESE_2020
+            else (
+                "AXF 2003 Chapter 4 Table 4-A "
+                f"(single-side {pattern.value}: check/chase/kill-TTC)"
+            )
+        )
+        return _TableDecision(
+            AdjudicationKind.MUST_CHANGE,
+            responsible,
+            reference,
+            f"{responsible.value}方循环构成{pattern_label}禁止着法，须变着",
+        )
+    return None
+
+
+def _chinese_bilateral_decision(
+    patterns: Mapping[Color, _CyclePattern],
+) -> _TableDecision:
+    red = patterns[Color.RED]
+    black = patterns[Color.BLACK]
+    if (red in _CHECK_PATTERNS) != (black in _CHECK_PATTERNS):
+        responsible = Color.RED if red in _CHECK_PATTERNS else Color.BLACK
+        return _TableDecision(
+            AdjudicationKind.MUST_CHANGE,
+            responsible,
+            "中国棋规2020 表项25.1、26.9.1（长将优先变着）",
+            "双方均有禁止着法，长将或将类组合方须变着",
+        )
+    if (
+        red in _KILL_WITHOUT_CHECK_PATTERNS
+    ) != (black in _KILL_WITHOUT_CHECK_PATTERNS):
+        responsible = (
+            Color.RED if red in _KILL_WITHOUT_CHECK_PATTERNS else Color.BLACK
+        )
+        return _TableDecision(
+            AdjudicationKind.MUST_CHANGE,
+            responsible,
+            "中国棋规2020 表项26.9.1（单方长杀相对长捉）",
+            "双方均有禁止着法，长杀或杀捉组合方须变着",
+        )
+    if {red, black} == {_CyclePattern.CHASE, _CyclePattern.JOINT_CHASE}:
+        responsible = (
+            Color.RED if red is _CyclePattern.CHASE else Color.BLACK
+        )
+        return _TableDecision(
+            AdjudicationKind.MUST_CHANGE,
+            responsible,
+            "中国棋规2020 表项26.9.2至26.9.3"
+            "（长捉车或无根子相对联合捉）",
+            "单子长捉车或无根子的一方相对联合捉方须变着",
+        )
+    return _TableDecision(
+        AdjudicationKind.DRAW,
+        None,
+        "中国棋规2020 表项26.9.4（其余双方禁止着法）",
+        "双方禁止着法同责或不属于26.9.1至26.9.3差等情形，判和",
+    )
+
+
+def _asian_bilateral_decision(
+    patterns: Mapping[Color, _CyclePattern],
+) -> _TableDecision:
+    red = patterns[Color.RED]
+    black = patterns[Color.BLACK]
+    if (red in _CHECK_PATTERNS) != (black in _CHECK_PATTERNS):
+        responsible = Color.RED if red in _CHECK_PATTERNS else Color.BLACK
+    elif (
+        red in _CHASE_WITHOUT_CHECK_PATTERNS
+    ) != (black in _CHASE_WITHOUT_CHECK_PATTERNS):
+        responsible = (
+            Color.RED if red in _CHASE_WITHOUT_CHECK_PATTERNS else Color.BLACK
+        )
+    else:
+        return _TableDecision(
+            AdjudicationKind.DRAW,
+            None,
+            "AXF 2003 Chapter 4 Table 4-D (same responsibility class)",
+            "双方循环属于相同责任级别，双方不变判和",
+        )
+    return _TableDecision(
+        AdjudicationKind.MUST_CHANGE,
+        responsible,
+        "AXF 2003 Chapter 4 Table 4-C "
+        "(check over chase; chase over kill/TTC)",
+        "双方循环责任类别不同，较重的将、捉或杀/TTC方须变着",
+    )
 
 
 def _evaluate_responsibility(
@@ -537,50 +730,35 @@ def _evaluate_responsibility(
     reference: str,
     cycle_start: int | None,
     ordered_natures: Sequence[MoveNature] | None = None,
+    patterns_override: Mapping[Color, _CyclePattern] | None = None,
 ) -> Adjudication:
     """Apply the formal responsibility table after tactical classification."""
     normalized = {color: tuple(by_side.get(color, ())) for color in Color}
     if not all(normalized.values()):
         raise ValueError("双方均须提供循环中的着法性质")
-    classifier = (
-        _chinese_responsibility
-        if ruleset is Ruleset.CHINESE_2020
-        else _asian_responsibility
+    patterns = (
+        dict(patterns_override)
+        if patterns_override is not None
+        else {
+            color: _cycle_pattern(natures)
+            for color, natures in normalized.items()
+        }
     )
-    scores = {color: classifier(natures) for color, natures in normalized.items()}
-    offenders = [color for color, score in scores.items() if score]
-    if not offenders:
-        return _make_result(
-            by_side=normalized,
-            cycle_start=cycle_start,
-            ruleset=ruleset,
-            reference=reference,
-            kind=AdjudicationKind.DRAW,
-            responsible=None,
-            reason="双方均为允许着法（含闲着或规则允许的混合攻击），判和",
-            ordered_natures=ordered_natures,
+    decision = _single_or_allowed_decision(patterns, ruleset=ruleset)
+    if decision is None:
+        decision = (
+            _chinese_bilateral_decision(patterns)
+            if ruleset is Ruleset.CHINESE_2020
+            else _asian_bilateral_decision(patterns)
         )
-    if len(offenders) == 2 and scores[offenders[0]] == scores[offenders[1]]:
-        return _make_result(
-            by_side=normalized,
-            cycle_start=cycle_start,
-            ruleset=ruleset,
-            reference=reference,
-            kind=AdjudicationKind.DRAW,
-            responsible=None,
-            reason="双方同时走出同等责任的禁止着法，双方不变判和",
-            ordered_natures=ordered_natures,
-        )
-    responsible = max(offenders, key=scores.__getitem__)
-    behavior = _labels(normalized[responsible])
     return _make_result(
         by_side=normalized,
         cycle_start=cycle_start,
         ruleset=ruleset,
-        reference=reference,
-        kind=AdjudicationKind.MUST_CHANGE,
-        responsible=responsible,
-        reason=f"责任方循环构成{behavior}类禁止着法，须由责任方变着",
+        reference=decision.reference,
+        kind=decision.kind,
+        responsible=decision.responsible,
+        reason=decision.reason,
         ordered_natures=ordered_natures,
     )
 
@@ -635,12 +813,26 @@ class Chinese2020Adjudicator(_AdjudicatorBase):
 
     def _evaluate_cycle(self, cycle: _Cycle) -> Adjudication:
         effective = _effective_cycle_natures(cycle)
+        patterns = {
+            color: _cycle_pattern_with_evidence(
+                tuple(frame for frame in cycle.frames if frame.side is color),
+                tuple(
+                    nature
+                    for frame, nature in zip(
+                        cycle.frames, effective, strict=True
+                    )
+                    if frame.side is color
+                ),
+            )
+            for color in Color
+        }
         return _evaluate_responsibility(
             _effective_natures_by_side(cycle, effective),
             self.ruleset,
             self._reference,
             cycle.start,
             effective,
+            patterns,
         )
 
 
@@ -657,10 +849,24 @@ class Asian2003Adjudicator(_AdjudicatorBase):
 
     def _evaluate_cycle(self, cycle: _Cycle) -> Adjudication:
         effective = _effective_cycle_natures(cycle)
+        patterns = {
+            color: _cycle_pattern_with_evidence(
+                tuple(frame for frame in cycle.frames if frame.side is color),
+                tuple(
+                    nature
+                    for frame, nature in zip(
+                        cycle.frames, effective, strict=True
+                    )
+                    if frame.side is color
+                ),
+            )
+            for color in Color
+        }
         return _evaluate_responsibility(
             _effective_natures_by_side(cycle, effective),
             self.ruleset,
             self._reference,
             cycle.start,
             effective,
+            patterns,
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import xiangqi.adjudication as adjudication_module
 from xiangqi.adjudication import (
     AdjudicationKind,
     Asian2003Adjudicator,
@@ -345,8 +346,8 @@ def test_rulesets_keep_independent_one_check_one_chase_policy() -> None:
 
     assert chinese.kind is AdjudicationKind.MUST_CHANGE
     assert chinese.responsible is Color.RED
-    assert asian.kind is AdjudicationKind.DRAW
-    assert asian.responsible is None
+    assert asian.kind is AdjudicationKind.MUST_CHANGE
+    assert asian.responsible is Color.RED
     assert chinese.rule_reference != asian.rule_reference
 
 
@@ -356,19 +357,28 @@ def test_rulesets_keep_independent_one_check_one_chase_policy() -> None:
         (
             (MoveNature.CHECK, MoveNature.KILL),
             AdjudicationKind.MUST_CHANGE,
-            AdjudicationKind.DRAW,
+            AdjudicationKind.MUST_CHANGE,
         ),
         (
             (MoveNature.CHECK, MoveNature.CHASE),
             AdjudicationKind.MUST_CHANGE,
-            AdjudicationKind.DRAW,
+            AdjudicationKind.MUST_CHANGE,
         ),
         (
             (MoveNature.KILL, MoveNature.CHASE),
             AdjudicationKind.MUST_CHANGE,
-            AdjudicationKind.DRAW,
+            AdjudicationKind.MUST_CHANGE,
         ),
-        ((MoveNature.KILL,), AdjudicationKind.MUST_CHANGE, AdjudicationKind.DRAW),
+        (
+            (MoveNature.CHECK, MoveNature.KILL, MoveNature.CHASE),
+            AdjudicationKind.MUST_CHANGE,
+            AdjudicationKind.MUST_CHANGE,
+        ),
+        (
+            (MoveNature.KILL,),
+            AdjudicationKind.MUST_CHANGE,
+            AdjudicationKind.MUST_CHANGE,
+        ),
         (
             (MoveNature.CHASE,),
             AdjudicationKind.MUST_CHANGE,
@@ -395,6 +405,150 @@ def test_formal_single_side_responsibility_table(
     assert asian.responsible is (
         Color.RED if asian_kind is AdjudicationKind.MUST_CHANGE else None
     )
+    assert "表项" in chinese.rule_reference
+    assert "Table" in asian.rule_reference
+
+
+@pytest.mark.parametrize(
+    "nature",
+    [
+        MoveNature.EXCHANGE,
+        MoveNature.SACRIFICE,
+        MoveNature.BLOCK,
+        MoveNature.FOLLOW,
+        MoveNature.IDLE,
+    ],
+)
+@pytest.mark.parametrize(
+    "adjudicator",
+    [Chinese2020Adjudicator(), Asian2003Adjudicator()],
+)
+def test_each_permitted_nature_is_explicitly_mapped_to_draw(
+    adjudicator, nature: MoveNature
+) -> None:
+    result = adjudicator.evaluate_natures(
+        {Color.RED: (nature,) * 2, Color.BLACK: (MoveNature.IDLE,) * 2}
+    )
+
+    assert result.kind is AdjudicationKind.DRAW
+    assert result.responsible is None
+    assert "允许" in result.reason or "闲" in result.reason
+    assert "表项" in result.rule_reference or "Table" in result.rule_reference
+
+
+@pytest.mark.parametrize(
+    ("red", "black", "responsible", "reference"),
+    [
+        (MoveNature.CHECK, MoveNature.CHASE, Color.RED, "25.1"),
+        (MoveNature.KILL, MoveNature.CHASE, Color.RED, "26.9.1"),
+        (MoveNature.CHASE, MoveNature.CHASE, None, "26.9.4"),
+        (MoveNature.KILL, MoveNature.KILL, None, "26.9.4"),
+    ],
+)
+def test_chinese_bilateral_prohibited_move_table_is_explicit(
+    red: MoveNature,
+    black: MoveNature,
+    responsible: Color | None,
+    reference: str,
+) -> None:
+    result = Chinese2020Adjudicator().evaluate_natures(
+        {Color.RED: (red,) * 2, Color.BLACK: (black,) * 2}
+    )
+
+    assert result.responsible is responsible
+    assert result.kind is (
+        AdjudicationKind.DRAW
+        if responsible is None
+        else AdjudicationKind.MUST_CHANGE
+    )
+    assert reference in result.rule_reference
+
+
+@pytest.mark.parametrize(
+    ("red", "black", "responsible", "table_item"),
+    [
+        (MoveNature.CHECK, MoveNature.CHASE, Color.RED, "Table 4-C"),
+        (MoveNature.CHECK, MoveNature.KILL, Color.RED, "Table 4-C"),
+        (MoveNature.CHASE, MoveNature.KILL, Color.RED, "Table 4-C"),
+        (MoveNature.KILL, MoveNature.KILL, None, "Table 4-D"),
+        (MoveNature.CHASE, MoveNature.CHASE, None, "Table 4-D"),
+    ],
+)
+def test_asian_bilateral_responsibility_table_is_explicit(
+    red: MoveNature,
+    black: MoveNature,
+    responsible: Color | None,
+    table_item: str,
+) -> None:
+    result = Asian2003Adjudicator().evaluate_natures(
+        {Color.RED: (red,) * 2, Color.BLACK: (black,) * 2}
+    )
+
+    assert result.responsible is responsible
+    assert result.kind is (
+        AdjudicationKind.DRAW
+        if responsible is None
+        else AdjudicationKind.MUST_CHANGE
+    )
+    assert table_item in result.rule_reference
+
+
+def test_rulesets_explicitly_reverse_kill_versus_chase_priority() -> None:
+    by_side = {
+        Color.RED: (MoveNature.KILL,) * 2,
+        Color.BLACK: (MoveNature.CHASE,) * 2,
+    }
+
+    chinese = Chinese2020Adjudicator().evaluate_natures(by_side)
+    asian = Asian2003Adjudicator().evaluate_natures(by_side)
+
+    assert chinese.responsible is Color.RED
+    assert asian.responsible is Color.BLACK
+    assert "26.9.1" in chinese.rule_reference
+    assert "Table 4-C" in asian.rule_reference
+
+
+def test_real_joint_attack_evidence_selects_joint_chase_table_row() -> None:
+    board = (
+        Board.empty()
+        .place(Coord(4, 0), _piece(Color.BLACK, PieceType.GENERAL))
+        .place(Coord(4, 9), _piece(Color.RED, PieceType.GENERAL))
+        .place(Coord(4, 5), _piece(Color.RED, PieceType.PAWN))
+        .place(Coord(0, 3), _piece(Color.RED, PieceType.ROOK))
+        .place(Coord(1, 3), _piece(Color.RED, PieceType.HORSE))
+        .place(Coord(3, 3), _piece(Color.BLACK, PieceType.ROOK))
+    )
+    _, frame = _play(board, Color.RED, (1, 3), (2, 5))
+
+    assert frame.nature is MoveNature.CHASE
+    assert [attack.target for attack in frame.attacks].count(Coord(3, 3)) == 2
+    pattern = adjudication_module._cycle_pattern_with_evidence(
+        (frame,), (MoveNature.CHASE,)
+    )
+    assert pattern.value == "joint_chase"
+
+
+def test_chinese_strong_chase_must_change_against_joint_chase() -> None:
+    pattern = adjudication_module._CyclePattern
+    decision = adjudication_module._chinese_bilateral_decision(
+        {Color.RED: pattern.CHASE, Color.BLACK: pattern.JOINT_CHASE}
+    )
+
+    assert decision.kind is AdjudicationKind.MUST_CHANGE
+    assert decision.responsible is Color.RED
+    assert "26.9.2" in decision.reference
+
+
+def test_fourth_unchanged_cycle_keeps_explicit_loss_evidence() -> None:
+    adjudicator = Chinese2020Adjudicator()
+    must_change = adjudicator.evaluate(_perpetual_check_history())
+
+    loss = adjudicator.loss_for_ignored_must_change(must_change)
+
+    assert loss.kind is AdjudicationKind.LOSS
+    assert loss.responsible is Color.RED
+    assert loss.rule_reference == must_change.rule_reference
+    assert loss.move_natures == must_change.move_natures
 
 
 @pytest.mark.parametrize(
