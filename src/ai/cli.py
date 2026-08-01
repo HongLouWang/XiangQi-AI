@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict, replace
@@ -24,8 +25,8 @@ def _positive_int(value: str) -> int:
 
 def _positive_float(value: str) -> float:
     parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("必须是大于 0 的数")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("必须是大于 0 的有限数")
     return parsed
 
 
@@ -117,6 +118,20 @@ def _print_status(status: RunStatus) -> None:
 
 
 def _train(args: argparse.Namespace) -> None:
+    run_dir: Path = args.run_dir
+    existing_entries = tuple(run_dir.iterdir()) if run_dir.exists() else ()
+    manager = CheckpointManager(run_dir)
+    if manager.has_checkpoint():
+        saved = _load_checkpoint_config(run_dir)
+        targets = [saved.target_games, args.games]
+        control = RunControl(run_dir)
+        if control.status_path.exists():
+            targets.append(control.read_status().target_games)
+        config = replace(saved, target_games=max(targets), run_dir=run_dir)
+        Trainer(config).run(resume=True)
+        return
+    if existing_entries:
+        raise RuntimeError(f"训练目录非空但没有可恢复的 checkpoint：{run_dir}")
     config = TrainingConfig(
         target_games=args.games,
         max_full_moves=args.full_moves,
@@ -151,7 +166,10 @@ def _resume(args: argparse.Namespace) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as error:
+        return int(error.code) if isinstance(error.code, int) else 1
     try:
         if args.command == "train":
             _train(args)

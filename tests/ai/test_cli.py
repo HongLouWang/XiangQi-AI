@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -186,6 +187,79 @@ def test_resume_only_overrides_device_threads_and_workers(
     assert captured.config.max_full_moves == 11
 
 
+def test_train_on_existing_checkpoint_resumes_with_saved_configuration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    saved = TrainingConfig(
+        target_games=20_000,
+        max_full_moves=17,
+        device="cpu",
+        torch_threads=3,
+        self_play_workers=2,
+        simulations_per_move=5,
+        channels=2,
+        residual_blocks=1,
+        batch_size=7,
+        run_dir=tmp_path,
+    )
+    _seed_checkpoint(tmp_path, saved)
+    _seed_status(tmp_path, target=25_000)
+    captured = _capture_trainer(monkeypatch)
+
+    assert main(["train", "--run-dir", str(tmp_path)]) == 0
+
+    assert captured.config == replace(saved, target_games=25_000)
+    assert captured.resume is True
+
+
+def test_train_on_checkpoint_can_raise_but_not_shrink_cumulative_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    saved = TrainingConfig(
+        target_games=7,
+        max_full_moves=11,
+        channels=2,
+        residual_blocks=1,
+        run_dir=tmp_path,
+    )
+    _seed_checkpoint(tmp_path, saved)
+    _seed_status(tmp_path, target=12)
+    captured = _capture_trainer(monkeypatch)
+
+    assert main(["train", "--run-dir", str(tmp_path), "--games", "15"]) == 0
+
+    assert captured.config == replace(saved, target_games=15)
+    assert captured.resume is True
+
+
+def test_train_with_damaged_checkpoint_fails_instead_of_restarting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "checkpoint-a.pt").write_bytes(b"damaged")
+    captured = _capture_trainer(monkeypatch)
+
+    assert main(["train", "--run-dir", str(tmp_path)]) == 1
+
+    assert captured.config is None
+    assert "checkpoint" in capsys.readouterr().err
+
+
+def test_train_refuses_a_nonempty_directory_without_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "unexpected.txt").write_text("keep", encoding="utf-8")
+    captured = _capture_trainer(monkeypatch)
+
+    assert main(["train", "--run-dir", str(tmp_path)]) == 1
+
+    assert captured.config is None
+    assert "非空" in capsys.readouterr().err
+
+
 def test_pause_writes_a_real_persistent_request(tmp_path: Path) -> None:
     _seed_status(tmp_path)
 
@@ -233,6 +307,31 @@ def test_runtime_errors_go_to_stderr_and_return_nonzero(
     assert captured.out == ""
     assert "错误" in captured.err
     assert "状态文件不存在" in captured.err
+
+
+def test_invalid_arguments_return_two_instead_of_raising_system_exit(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = main(["train", "--games", "0"])
+
+    assert result == 2
+    assert "error" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_learning_rate_rejects_non_finite_values(
+    value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert not math.isfinite(float(value))
+
+    assert main(["train", "--learning-rate", value]) == 2
+
+    assert "error" in capsys.readouterr().err
+
+
+def test_main_help_returns_zero(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--help"]) == 0
+    assert "1024 ply" in capsys.readouterr().out
 
 
 def test_resume_without_checkpoint_is_an_error(
