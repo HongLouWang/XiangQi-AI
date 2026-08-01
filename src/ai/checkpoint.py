@@ -100,11 +100,11 @@ class CheckpointManager:
             "scheduler_state": None if scheduler is None else scheduler.state_dict(),
             "replay_manifest_hash": replay_manifest_hash,
             "replay_manifest_version": replay_manifest_version,
-            "python_rng_state": random.getstate(),
-            "numpy_rng_state": np.random.get_state(),
+            "python_rng_state": self._encode_python_rng(random.getstate()),
+            "numpy_rng_state": self._encode_numpy_rng(np.random.get_state()),
             "numpy_generator_state": None
             if numpy_generator is None
-            else deepcopy(numpy_generator.bit_generator.state),
+            else self._encode_safe(deepcopy(numpy_generator.bit_generator.state)),
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_states": torch.cuda.get_rng_state_all()
             if torch.cuda.is_available()
@@ -138,28 +138,32 @@ class CheckpointManager:
         expected_replay_manifest_version: int | None = None,
     ) -> LoadedCheckpoint:
         errors: list[str] = []
+        compatibility_errors: list[CheckpointCompatibilityError] = []
         for slot in self._candidate_slots():
             try:
                 payload = torch.load(
-                    self._slots[slot], map_location=map_location, weights_only=False
+                    self._slots[slot], map_location=map_location, weights_only=True
                 )
-                loaded = self._validate_payload(payload, expected_config)
-                if (
-                    expected_replay_manifest_hash is not None
-                    and loaded.replay_manifest_hash != expected_replay_manifest_hash
-                ):
-                    raise CheckpointCompatibilityError(
-                        "checkpoint 与当前 Replay manifest hash 不一致"
-                    )
-                if (
-                    expected_replay_manifest_version is not None
-                    and loaded.replay_manifest_version
-                    != expected_replay_manifest_version
-                ):
-                    raise CheckpointCompatibilityError(
-                        "checkpoint 与当前 Replay manifest version 不一致"
-                    )
+                loaded = self._validate_payload(payload)
                 self._validate_model_state(model, payload["model_state"])
+            except CheckpointCompatibilityError as error:
+                compatibility_errors.append(error)
+                errors.append(f"{slot}: {error}")
+                continue
+            except Exception as error:  # noqa: BLE001 - 损坏存档可抛出多种安全异常
+                errors.append(f"{slot}: {error}")
+                continue
+
+            self._validate_caller_compatibility(
+                loaded,
+                expected_config,
+                expected_replay_manifest_hash,
+                expected_replay_manifest_version,
+            )
+            snapshots = self._capture_restore_snapshots(
+                model, optimizer, scheduler, numpy_generator
+            )
+            try:
                 model.load_state_dict(payload["model_state"])
                 try:
                     optimizer.load_state_dict(payload["optimizer_state"])
@@ -177,10 +181,13 @@ class CheckpointManager:
                 if restore_rng:
                     self._restore_rng(payload, numpy_generator)
                 return loaded
-            except CheckpointCompatibilityError:
-                raise
             except Exception as error:  # noqa: BLE001 - 损坏的 torch 存档可能抛出多种异常
+                self._rollback_restore(
+                    snapshots, model, optimizer, scheduler, numpy_generator
+                )
                 errors.append(f"{slot}: {error}")
+        if compatibility_errors and len(compatibility_errors) == len(errors):
+            raise compatibility_errors[-1]
         raise RuntimeError("没有可加载的 checkpoint；" + "; ".join(errors))
 
     def export_model(self, model: nn.Module, destination: Path | str) -> Path:
@@ -198,9 +205,7 @@ class CheckpointManager:
             temporary.unlink(missing_ok=True)
         return output
 
-    def _validate_payload(
-        self, payload: object, expected_config: TrainingConfig | None
-    ) -> LoadedCheckpoint:
+    def _validate_payload(self, payload: object) -> LoadedCheckpoint:
         if not isinstance(payload, dict):
             raise TypeError("checkpoint payload 不是字典")
         required = (
@@ -251,14 +256,6 @@ class CheckpointManager:
             progress = TrainingProgress(**payload["progress"])
         except (KeyError, TypeError, ValueError) as error:
             raise CheckpointCompatibilityError("checkpoint 配置或进度无效") from error
-        if expected_config is not None:
-            for name in ("channels", "residual_blocks"):
-                actual = getattr(config, name)
-                expected = getattr(expected_config, name)
-                if actual != expected:
-                    raise CheckpointCompatibilityError(
-                        f"checkpoint {name} 不兼容：{actual} != {expected}"
-                    )
         return LoadedCheckpoint(
             progress=progress,
             config=config,
@@ -266,6 +263,36 @@ class CheckpointManager:
             replay_manifest_version=payload["replay_manifest_version"],
             generation=int(payload["generation"]),
         )
+
+    @staticmethod
+    def _validate_caller_compatibility(
+        loaded: LoadedCheckpoint,
+        expected_config: TrainingConfig | None,
+        expected_replay_manifest_hash: str | None,
+        expected_replay_manifest_version: int | None,
+    ) -> None:
+        if expected_config is not None:
+            for name in ("channels", "residual_blocks"):
+                actual = getattr(loaded.config, name)
+                expected = getattr(expected_config, name)
+                if actual != expected:
+                    raise CheckpointCompatibilityError(
+                        f"checkpoint {name} 不兼容：{actual} != {expected}"
+                    )
+        if (
+            expected_replay_manifest_hash is not None
+            and loaded.replay_manifest_hash != expected_replay_manifest_hash
+        ):
+            raise CheckpointCompatibilityError(
+                "checkpoint 与当前 Replay manifest hash 不一致"
+            )
+        if (
+            expected_replay_manifest_version is not None
+            and loaded.replay_manifest_version != expected_replay_manifest_version
+        ):
+            raise CheckpointCompatibilityError(
+                "checkpoint 与当前 Replay manifest version 不一致"
+            )
 
     @staticmethod
     def _validate_model_state(model: nn.Module, saved_state: object) -> None:
@@ -287,24 +314,176 @@ class CheckpointManager:
     def _restore_rng(
         payload: dict[str, Any], numpy_generator: np.random.Generator | None
     ) -> None:
-        random.setstate(payload["python_rng_state"])
-        np.random.set_state(payload["numpy_rng_state"])
+        python_state = CheckpointManager._decode_python_rng(payload["python_rng_state"])
+        numpy_state = CheckpointManager._decode_numpy_rng(payload["numpy_rng_state"])
         generator_state = payload["numpy_generator_state"]
+        decoded_generator = (
+            None
+            if generator_state is None
+            else CheckpointManager._decode_safe(generator_state)
+        )
         if numpy_generator is not None:
-            if generator_state is None:
+            if decoded_generator is None:
                 raise CheckpointCompatibilityError(
                     "checkpoint 不含实际 NumPy Generator 状态"
                 )
             try:
-                numpy_generator.bit_generator.state = generator_state
+                test_generator = type(numpy_generator.bit_generator)()
+                test_generator.state = decoded_generator
             except (TypeError, ValueError) as error:
                 raise CheckpointCompatibilityError(
                     "NumPy Generator 类型与 checkpoint 不兼容"
                 ) from error
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        if numpy_generator is not None:
+            numpy_generator.bit_generator.state = decoded_generator
         torch.set_rng_state(payload["torch_rng_state"].cpu())
         cuda_states = payload.get("cuda_rng_states")
         if cuda_states is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all([state.cpu() for state in cuda_states])
+
+    @staticmethod
+    def _encode_python_rng(state: tuple[Any, ...]) -> dict[str, object]:
+        version, values, gaussian = state
+        return {
+            "version": int(version),
+            "values": torch.tensor(values, dtype=torch.int64),
+            "gaussian": gaussian,
+        }
+
+    @staticmethod
+    def _decode_python_rng(state: object) -> tuple[Any, ...]:
+        if not isinstance(state, dict) or not isinstance(
+            state.get("values"), torch.Tensor
+        ):
+            raise CheckpointCompatibilityError("checkpoint Python RNG 状态无效")
+        try:
+            return (
+                int(state["version"]),
+                tuple(int(value) for value in state["values"].tolist()),
+                state["gaussian"],
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise CheckpointCompatibilityError(
+                "checkpoint Python RNG 状态无效"
+            ) from error
+
+    @staticmethod
+    def _encode_numpy_rng(state: tuple[Any, ...]) -> dict[str, object]:
+        algorithm, keys, position, has_gaussian, cached_gaussian = state
+        return {
+            "algorithm": str(algorithm),
+            "keys": torch.from_numpy(np.asarray(keys, dtype=np.int64)),
+            "position": int(position),
+            "has_gaussian": int(has_gaussian),
+            "cached_gaussian": float(cached_gaussian),
+        }
+
+    @staticmethod
+    def _decode_numpy_rng(state: object) -> tuple[Any, ...]:
+        if not isinstance(state, dict) or not isinstance(
+            state.get("keys"), torch.Tensor
+        ):
+            raise CheckpointCompatibilityError("checkpoint NumPy RNG 状态无效")
+        try:
+            return (
+                str(state["algorithm"]),
+                state["keys"].cpu().numpy().astype(np.uint32),
+                int(state["position"]),
+                int(state["has_gaussian"]),
+                float(state["cached_gaussian"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise CheckpointCompatibilityError(
+                "checkpoint NumPy RNG 状态无效"
+            ) from error
+
+    @staticmethod
+    def _encode_safe(value: object) -> object:
+        if isinstance(value, np.ndarray):
+            return {"__kind__": "ndarray", "value": torch.from_numpy(value.copy())}
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {
+                str(key): CheckpointManager._encode_safe(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, tuple):
+            return {
+                "__kind__": "tuple",
+                "value": [CheckpointManager._encode_safe(item) for item in value],
+            }
+        if isinstance(value, list):
+            return [CheckpointManager._encode_safe(item) for item in value]
+        if value is None or isinstance(value, (str, int, float, bool, torch.Tensor)):
+            return value
+        raise TypeError(f"不能安全持久化的 RNG 状态类型：{type(value).__name__}")
+
+    @staticmethod
+    def _decode_safe(value: object) -> object:
+        if isinstance(value, dict):
+            if value.get("__kind__") == "ndarray":
+                tensor = value.get("value")
+                if not isinstance(tensor, torch.Tensor):
+                    raise CheckpointCompatibilityError("安全数组编码无效")
+                return tensor.cpu().numpy().copy()
+            if value.get("__kind__") == "tuple":
+                items = value.get("value")
+                if not isinstance(items, list):
+                    raise CheckpointCompatibilityError("安全元组编码无效")
+                return tuple(CheckpointManager._decode_safe(item) for item in items)
+            return {
+                key: CheckpointManager._decode_safe(item) for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [CheckpointManager._decode_safe(item) for item in value]
+        return value
+
+    @staticmethod
+    def _capture_restore_snapshots(
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Any | None,
+        numpy_generator: np.random.Generator | None,
+    ) -> dict[str, object]:
+        return {
+            "model": deepcopy(model.state_dict()),
+            "optimizer": deepcopy(optimizer.state_dict()),
+            "scheduler": None
+            if scheduler is None
+            else deepcopy(scheduler.state_dict()),
+            "python_rng": random.getstate(),
+            "numpy_rng": np.random.get_state(),
+            "generator_rng": None
+            if numpy_generator is None
+            else deepcopy(numpy_generator.bit_generator.state),
+            "torch_rng": torch.get_rng_state().clone(),
+            "cuda_rng": [state.clone() for state in torch.cuda.get_rng_state_all()]
+            if torch.cuda.is_available()
+            else None,
+        }
+
+    @staticmethod
+    def _rollback_restore(
+        snapshots: dict[str, object],
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Any | None,
+        numpy_generator: np.random.Generator | None,
+    ) -> None:
+        model.load_state_dict(snapshots["model"])
+        optimizer.load_state_dict(snapshots["optimizer"])
+        if scheduler is not None:
+            scheduler.load_state_dict(snapshots["scheduler"])
+        random.setstate(snapshots["python_rng"])
+        np.random.set_state(snapshots["numpy_rng"])
+        if numpy_generator is not None:
+            numpy_generator.bit_generator.state = snapshots["generator_rng"]
+        torch.set_rng_state(snapshots["torch_rng"])
+        if snapshots["cuda_rng"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(snapshots["cuda_rng"])
 
     def _candidate_slots(self) -> tuple[str, ...]:
         pointer = self._pointer_or_none()
@@ -317,7 +496,7 @@ class CheckpointManager:
             if not path.is_file():
                 continue
             try:
-                payload = torch.load(path, map_location="cpu", weights_only=False)
+                payload = torch.load(path, map_location="cpu", weights_only=True)
                 candidates.append((int(payload["generation"]), slot))
             except Exception:  # noqa: BLE001, S112 - 扫描时忽略任意损坏槽
                 continue
@@ -338,7 +517,7 @@ class CheckpointManager:
         ):
             raise ValueError("latest.json 无效")
         slot = str(pointer["slot"])
-        payload = torch.load(self._slots[slot], map_location="cpu", weights_only=False)
+        payload = torch.load(self._slots[slot], map_location="cpu", weights_only=True)
         if (
             not isinstance(payload, dict)
             or payload.get("generation") != pointer["generation"]

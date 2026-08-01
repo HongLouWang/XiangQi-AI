@@ -150,7 +150,12 @@ class ReplayBuffer:
         }
         for name, version in expected.items():
             try:
-                actual = int(np.asarray(data[name]).reshape(-1)[0])
+                version_array = np.asarray(data[name])
+                if version_array.shape != (1,) or not np.issubdtype(
+                    version_array.dtype, np.integer
+                ):
+                    raise ValueError
+                actual = int(version_array[0])
             except (KeyError, IndexError, TypeError, ValueError) as error:
                 raise ReplayCompatibilityError(
                     f"Replay 棋局 {game_id} 缺少有效 {name}"
@@ -179,9 +184,11 @@ class ReplayBuffer:
         offsets = data["policy_offsets"]
         values = data["values"]
         sides = data["sides"]
+        plies = data["plies"]
         sample_count = int(values.shape[0]) if values.ndim == 1 else -1
         valid_offsets = (
             offsets.ndim == 1
+            and np.issubdtype(offsets.dtype, np.integer)
             and offsets.shape[0] == sample_count + 1
             and offsets.shape[0] > 0
             and int(offsets[0]) == 0
@@ -197,7 +204,18 @@ class ReplayBuffer:
         ):
             raise ReplayCompatibilityError(f"Replay 棋局 {game_id} 的样本形状无效")
         if (
-            indices.ndim != 1
+            not np.all(np.isfinite(states))
+            or not np.issubdtype(sides.dtype, np.integer)
+            or np.any((sides != 0) & (sides != 1))
+            or plies.shape != (1,)
+            or not np.issubdtype(plies.dtype, np.integer)
+            or int(plies[0]) < 0
+            or int(plies[0]) != sample_count
+        ):
+            raise ReplayCompatibilityError(f"Replay 棋局 {game_id} 的局面元数据无效")
+        if (
+            not np.issubdtype(indices.dtype, np.integer)
+            or indices.ndim != 1
             or probabilities.shape != indices.shape
             or np.any(indices < 0)
             or np.any(indices >= ACTION_SIZE)
@@ -209,6 +227,9 @@ class ReplayBuffer:
         ):
             raise ReplayCompatibilityError(f"Replay 棋局 {game_id} 的稀疏策略无效")
         for start, end in pairwise(offsets):
+            sample_indices = indices[int(start) : int(end)]
+            if np.unique(sample_indices).size != sample_indices.size:
+                raise ReplayCompatibilityError(f"Replay 棋局 {game_id} 的动作索引重复")
             if not np.isclose(float(probabilities[int(start) : int(end)].sum()), 1.0):
                 raise ReplayCompatibilityError(
                     f"Replay 棋局 {game_id} 的策略概率之和无效"

@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -96,6 +97,22 @@ def test_game_payload_version_is_checked_when_sampled(tmp_path: Path) -> None:
         replay.sample(1, np.random.default_rng(0))
 
 
+def test_fractional_game_version_is_not_truncated_to_current_version(
+    tmp_path: Path,
+) -> None:
+    replay = ReplayBuffer(tmp_path, capacity_games=1)
+    replay.append_game(_game(6))
+    game_path = tmp_path / "games" / "000000000001.npz"
+    with np.load(game_path, allow_pickle=False) as stored:
+        payload = {key: stored[key] for key in stored.files}
+    payload["action_version"] = np.asarray([1.5], dtype=np.float64)
+    with game_path.open("wb") as stream:
+        np.savez_compressed(stream, **payload)
+
+    with pytest.raises(ReplayCompatibilityError, match="action_version"):
+        replay.sample(1, np.random.default_rng(0))
+
+
 def test_manifest_fsync_error_never_leaves_published_manifest_without_game(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -139,3 +156,32 @@ def test_manifest_rejects_nonadvancing_game_cursor(tmp_path: Path) -> None:
 
     with pytest.raises(ReplayCompatibilityError, match="next_game_id"):
         ReplayBuffer(tmp_path, capacity_games=2)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("states", lambda value: np.full_like(value, np.nan)),
+        ("sides", lambda value: np.full_like(value, 2)),
+        ("plies", lambda value: np.asarray([-1], dtype=np.int64)),
+        ("plies", lambda value: np.asarray([1], dtype=np.int64)),
+        ("plies", lambda value: np.asarray([[2]], dtype=np.int64)),
+        ("policy_indices", lambda value: np.full_like(value, int(value[0]))),
+        ("policy_indices", lambda value: value.astype(np.float32)),
+        ("policy_offsets", lambda value: value.astype(np.float32) + 0.25),
+    ],
+)
+def test_poisoned_game_payload_is_explicitly_rejected(
+    tmp_path: Path, field: str, replacement: Callable[[np.ndarray], np.ndarray]
+) -> None:
+    replay = ReplayBuffer(tmp_path, capacity_games=1)
+    replay.append_game(_game(10))
+    game_path = tmp_path / "games" / "000000000001.npz"
+    with np.load(game_path, allow_pickle=False) as stored:
+        payload = {key: stored[key] for key in stored.files}
+    payload[field] = replacement(payload[field])
+    with game_path.open("wb") as stream:
+        np.savez_compressed(stream, **payload)
+
+    with pytest.raises(ReplayCompatibilityError):
+        replay.sample(1, np.random.default_rng(0))

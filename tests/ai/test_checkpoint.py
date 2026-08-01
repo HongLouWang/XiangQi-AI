@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,6 +19,35 @@ from ai.config import TrainingConfig
 from ai.network import PolicyValueNetwork
 
 _REPLAY_HASH = "a" * 64
+
+
+def _write_marker(path: str) -> int:
+    Path(path).write_text("executed")
+    return 1
+
+
+class _EvilPayload:
+    def __init__(self, marker: Path) -> None:
+        self.marker = marker
+
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return _write_marker, (str(self.marker),)
+
+
+class _FailingScheduler:
+    def __init__(self, value: int = 1) -> None:
+        self.value = value
+
+    def state_dict(self) -> dict[str, int]:
+        return {"value": self.value}
+
+    def load_state_dict(self, state: object) -> None:
+        assert isinstance(state, dict)
+        if state["value"] == 1:
+            self.value = 1
+            return
+        self.value = 999
+        raise ValueError("scheduler corrupt")
 
 
 def _save(manager: CheckpointManager, *args: object, **kwargs: object) -> Path:
@@ -144,6 +174,24 @@ def test_corrupt_latest_checkpoint_falls_back_to_previous_slot(tmp_path: Path) -
     assert restored.progress.completed_games == 1
 
 
+def test_untrusted_pickle_is_never_executed_and_previous_slot_recovers(
+    tmp_path: Path,
+) -> None:
+    model, optimizer = _objects()
+    config = TrainingConfig(channels=4, residual_blocks=1, run_dir=tmp_path)
+    manager = CheckpointManager(tmp_path)
+    _save(manager, model, optimizer, TrainingProgress(1, 10_000, 1), config)
+    marker = tmp_path / "pickle-executed"
+    torch.save(_EvilPayload(marker), tmp_path / "checkpoint-b.pt")
+    manager.pointer_path.write_text('{"slot": "b", "generation": 2}')
+
+    fresh_model, fresh_optimizer = _objects()
+    restored = manager.load_latest(fresh_model, fresh_optimizer, map_location="cpu")
+
+    assert restored.progress.completed_games == 1
+    assert not marker.exists()
+
+
 def test_corrupt_latest_pointer_recovers_highest_valid_generation(
     tmp_path: Path,
 ) -> None:
@@ -181,7 +229,7 @@ def test_missing_required_checkpoint_field_is_explicitly_rejected(
     config = TrainingConfig(channels=4, residual_blocks=1, run_dir=tmp_path)
     manager = CheckpointManager(tmp_path)
     path = _save(manager, model, optimizer, TrainingProgress(1, 10_000, 1), config)
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
     del payload["replay_manifest_version"]
     torch.save(payload, path)
     fresh_model, fresh_optimizer = _objects()
@@ -190,7 +238,7 @@ def test_missing_required_checkpoint_field_is_explicitly_rejected(
         manager.load_latest(fresh_model, fresh_optimizer, map_location="cpu")
 
 
-def test_incompatible_latest_slot_is_explicitly_rejected(
+def test_structurally_incompatible_latest_slot_falls_back_to_previous(
     tmp_path: Path,
 ) -> None:
     model, optimizer = _objects()
@@ -198,13 +246,30 @@ def test_incompatible_latest_slot_is_explicitly_rejected(
     manager = CheckpointManager(tmp_path)
     _save(manager, model, optimizer, TrainingProgress(1, 10_000, 1), config)
     newest = _save(manager, model, optimizer, TrainingProgress(2, 10_000, 2), config)
-    payload = torch.load(newest, map_location="cpu", weights_only=False)
+    payload = torch.load(newest, map_location="cpu", weights_only=True)
     payload["schema_version"] = 99
     torch.save(payload, newest)
 
     fresh_model, fresh_optimizer = _objects()
-    with pytest.raises(CheckpointCompatibilityError, match="schema_version"):
-        manager.load_latest(fresh_model, fresh_optimizer, map_location="cpu")
+    restored = manager.load_latest(fresh_model, fresh_optimizer, map_location="cpu")
+    assert restored.progress.completed_games == 1
+
+
+def test_latest_slot_with_corrupt_model_state_falls_back_to_previous(
+    tmp_path: Path,
+) -> None:
+    model, optimizer = _objects()
+    config = TrainingConfig(channels=4, residual_blocks=1, run_dir=tmp_path)
+    manager = CheckpointManager(tmp_path)
+    _save(manager, model, optimizer, TrainingProgress(1, 10_000, 1), config)
+    newest = _save(manager, model, optimizer, TrainingProgress(2, 10_000, 2), config)
+    payload = torch.load(newest, map_location="cpu", weights_only=True)
+    payload["model_state"]["trunk.0.weight"] = torch.zeros(1)
+    torch.save(payload, newest)
+
+    fresh_model, fresh_optimizer = _objects()
+    restored = manager.load_latest(fresh_model, fresh_optimizer, map_location="cpu")
+    assert restored.progress.completed_games == 1
 
 
 def test_replay_manifest_mismatch_is_explicitly_rejected(tmp_path: Path) -> None:
@@ -250,6 +315,49 @@ def test_scheduler_state_round_trips_from_disk(tmp_path: Path) -> None:
         map_location="cpu",
     )
     assert fresh_scheduler.state_dict() == scheduler.state_dict()
+
+
+def test_failed_restore_rolls_back_model_optimizer_scheduler_and_all_rng(
+    tmp_path: Path,
+) -> None:
+    saved_model, saved_optimizer = _objects()
+    saved_generator = np.random.default_rng(40)
+    config = TrainingConfig(channels=4, residual_blocks=1, run_dir=tmp_path)
+    manager = CheckpointManager(tmp_path)
+    _save(
+        manager,
+        saved_model,
+        saved_optimizer,
+        TrainingProgress(1, 10_000, 1),
+        config,
+        scheduler=_FailingScheduler(2),
+        numpy_generator=saved_generator,
+    )
+    model, optimizer = _objects()
+    scheduler = _FailingScheduler()
+    before_model = {key: value.clone() for key, value in model.state_dict().items()}
+    before_optimizer = deepcopy(optimizer.state_dict())
+    random.seed(31)
+    np.random.seed(32)
+    torch.manual_seed(33)
+    before_python = random.getstate()
+    before_numpy = np.random.get_state()
+    before_torch = torch.get_rng_state().clone()
+    generator = np.random.default_rng(41)
+    before_generator = deepcopy(generator.bit_generator.state)
+
+    with pytest.raises(RuntimeError, match="没有可加载"):
+        manager.load_latest(
+            model, optimizer, scheduler=scheduler, numpy_generator=generator
+        )
+
+    _assert_nested_equal(before_model, model.state_dict())
+    _assert_nested_equal(before_optimizer, optimizer.state_dict())
+    assert scheduler.value == 1
+    assert random.getstate() == before_python
+    assert np.array_equal(np.random.get_state()[1], before_numpy[1])
+    assert torch.equal(torch.get_rng_state(), before_torch)
+    assert generator.bit_generator.state == before_generator
 
 
 def test_failed_new_slot_write_preserves_previous_checkpoint(
