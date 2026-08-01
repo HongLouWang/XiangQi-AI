@@ -2,8 +2,8 @@
 
 ## 目标
 
-新增一个可直接在服务器项目目录运行的独立 Python 文件
-`count_training_results.py`。脚本只读检查指定 AlphaZero 训练目录，统计已经完整写入
+新增一个可直接在服务器 AI 目录运行的独立 Python 文件
+`src/ai/count_training_results.py`。脚本只读检查指定 AlphaZero 训练目录，统计已经完整写入
 Replay 的红胜、黑胜与和棋局数，同时显示训练进度和无法解析的数据文件。
 
 ## 使用方式
@@ -11,19 +11,19 @@ Replay 的红胜、黑胜与和棋局数，同时显示训练进度和无法解�
 默认统计服务器当前主训练目录：
 
 ```bash
-cd /XiangQi-AI
-.venv/bin/python count_training_results.py
+cd /XiangQi-AI/src/ai
+../../.venv/bin/python count_training_results.py
 ```
 
 也允许显式指定其他训练目录：
 
 ```bash
-.venv/bin/python count_training_results.py \
-  --run-dir src/ai/AI-runs/cpu-main
+../../.venv/bin/python count_training_results.py \
+  --run-dir AI-runs/cpu-main
 ```
 
-`--run-dir` 的默认值为 `src/ai/AI-runs/cpu-main`。脚本不依赖当前工作目录来
-解析默认路径，而是以脚本所在的项目根目录为基准。
+`--run-dir` 的默认值为脚本同级的 `AI-runs/cpu-main`。脚本不依赖当前工作目录来
+解析默认路径，而是以脚本所在的 AI 目录为基准。
 
 ## 数据来源与判定
 
@@ -58,7 +58,7 @@ cd /XiangQi-AI
 测试先构造最小临时训练目录和 NPZ 数据，覆盖红胜、黑胜、和棋、异常文件、路径解析
 及 CLI 输出。测试先失败，再实现最小代码使其通过。
 
-本地测试通过后，只上传 `count_training_results.py` 到服务器
-`/XiangQi-AI/count_training_results.py`，不上传其他工作区文件、不重启训练进程。
+本地测试通过后，只上传 `src/ai/count_training_results.py` 到服务器
+`/XiangQi-AI/src/ai/count_training_results.py`，不上传其他工作区文件、不重启训练进程。
 随后使用服务器现有 `.venv/bin/python` 运行脚本，并将现场统计结果与 `status.json`
 和 manifest 的局数进行一致性核对。

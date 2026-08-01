@@ -12,13 +12,13 @@
 
 ## 文件结构
 
-- 新建 `count_training_results.py`：路径解析、JSON/NPZ 读取、棋局分类、中文报告和 CLI。
+- 新建 `src/ai/count_training_results.py`：路径解析、JSON/NPZ 读取、棋局分类、中文报告和 CLI。
 - 新建 `tests/test_count_training_results.py`：临时训练目录夹具、分类、错误隔离、默认路径和 CLI 测试。
 
 ### Task 1: 核心统计与错误隔离
 
 **Files:**
-- Create: `count_training_results.py`
+- Create: `src/ai/count_training_results.py`
 - Test: `tests/test_count_training_results.py`
 
 - [ ] **Step 1: 写红胜、黑胜、和棋与异常文件的失败测试**
@@ -126,20 +126,20 @@ Expected: 全部 PASS。
 - [ ] **Step 9: 提交核心统计**
 
 ```bash
-git add count_training_results.py tests/test_count_training_results.py
+git add src/ai/count_training_results.py tests/test_count_training_results.py
 git commit -m "功能：新增训练棋局胜负统计"
 ```
 
 ### Task 2: CLI、完整验证与服务器部署
 
 **Files:**
-- Modify: `count_training_results.py`
+- Modify: `src/ai/count_training_results.py`
 - Modify: `tests/test_count_training_results.py`
 
 - [ ] **Step 1: 写默认路径、中文输出和错误退出测试**
 
-用 monkeypatch 替换模块级 `PROJECT_ROOT` 为临时项目目录，断言无参数时解析
-`src/ai/AI-runs/cpu-main`。调用 `main([...])` 并检查：
+用 monkeypatch 替换模块级 `AI_ROOT` 为临时 AI 目录，断言无参数时解析
+`AI-runs/cpu-main`。调用 `main([...])` 并检查：
 
 ```python
 assert exit_code == 0
@@ -159,8 +159,8 @@ Expected: CLI 测试 FAIL，因为 `main` 和格式化输出尚未实现。
 
 - [ ] **Step 3: 实现 CLI 和中文报告**
 
-定义 `PROJECT_ROOT = Path(__file__).resolve().parent`；argparse 的 `--run-dir` 默认值为
-`PROJECT_ROOT / "src/ai/AI-runs/cpu-main"`，相对的用户参数按当前工作目录解析。实现
+定义 `AI_ROOT = Path(__file__).resolve().parent`；argparse 的 `--run-dir` 默认值为
+`AI_ROOT / "AI-runs/cpu-main"`，相对的用户参数按当前工作目录解析。实现
 `format_report(report, observed_at)`，输出北京时间 ISO 时间、绝对训练目录、阶段、
 `completed/target` 进度、历史累计、当前保留、已分类及胜负和异常；异常不为空时逐行
 列出棋局 ID 与单行原因。`main()` 捕获 `TrainingDataError`，向 stderr 输出
@@ -179,9 +179,9 @@ Expected: 全部项目测试 PASS；如有既存失败，准确记录完整数�
 - [ ] **Step 5: 静态验证和本地真实目录试运行**
 
 ```bash
-.venv/bin/python -m py_compile count_training_results.py
+.venv/bin/python -m py_compile src/ai/count_training_results.py
 git diff --check
-.venv/bin/python count_training_results.py \
+.venv/bin/python src/ai/count_training_results.py \
   --run-dir src/ai/AI-runs/cpu-main
 ```
 
@@ -191,22 +191,22 @@ Expected: 编译与 diff 检查退出码为 `0`；本地目录不存在时只允
 - [ ] **Step 6: 提交 CLI 与测试**
 
 ```bash
-git add count_training_results.py tests/test_count_training_results.py
+git add src/ai/count_training_results.py tests/test_count_training_results.py
 git commit -m "完善：增加训练胜负统计命令行输出"
 ```
 
 - [ ] **Step 7: 只上传独立脚本**
 
-使用项目已有 SFTP 凭据，仅将本地 `count_training_results.py` 上传到
-`/XiangQi-AI/count_training_results.py`。上传前后分别计算本地与远端 SHA-256，要求
+使用项目已有 SFTP 凭据，仅将本地 `src/ai/count_training_results.py` 上传到
+`/XiangQi-AI/src/ai/count_training_results.py`。上传前后分别计算本地与远端 SHA-256，要求
 两者完全一致；不上传 `.vscode`、测试、规格或计划，不重启训练进程。
 
 - [ ] **Step 8: 在服务器只读运行并核对快照**
 
 ```bash
-cd /XiangQi-AI
-.venv/bin/python count_training_results.py \
-  --run-dir src/ai/AI-runs/cpu-main
+cd /XiangQi-AI/src/ai
+../../.venv/bin/python count_training_results.py \
+  --run-dir AI-runs/cpu-main
 ```
 
 Expected: 退出码 `0`，胜负和异常之和等于当前保留棋局数；manifest 历史累计局数与
