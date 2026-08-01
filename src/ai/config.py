@@ -26,12 +26,15 @@ class TrainingConfig:
             "torch_threads": self.torch_threads,
             "self_play_workers": self.self_play_workers,
             "simulations_per_move": self.simulations_per_move,
+            "residual_blocks": self.residual_blocks,
+            "channels": self.channels,
             "batch_size": self.batch_size,
             "replay_capacity_games": self.replay_capacity_games,
+            "checkpoint_interval_games": self.checkpoint_interval_games,
         }
         for name, value in positive.items():
-            if value <= 0:
-                raise ValueError(f"{name} 必须大于 0")
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} 必须是大于 0 的整数")
 
     @property
     def max_plies(self) -> int:

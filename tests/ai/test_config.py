@@ -17,14 +17,21 @@ def test_training_scale_can_be_changed_from_python() -> None:
 
 
 @pytest.mark.parametrize(
-    "field,value",
+    "field",
     [
-        ("target_games", 0),
-        ("max_full_moves", 0),
-        ("self_play_workers", 0),
-        ("torch_threads", 0),
+        "target_games",
+        "max_full_moves",
+        "torch_threads",
+        "self_play_workers",
+        "simulations_per_move",
+        "residual_blocks",
+        "channels",
+        "batch_size",
+        "replay_capacity_games",
+        "checkpoint_interval_games",
     ],
 )
-def test_positive_configuration_is_required(field: str, value: int) -> None:
+@pytest.mark.parametrize("value", [0, 1.5, True])
+def test_positive_integer_configuration_is_required(field: str, value: object) -> None:
     with pytest.raises(ValueError):
         TrainingConfig(**{field: value})
