@@ -263,7 +263,7 @@ class Trainer:
         # Replay 的完整棋局可能在上次 checkpoint 后已经原子提交。立即同步新
         # checkpoint，使下一次恢复重新回到严格 hash 一致状态。
         self._save_checkpoint()
-        self.replay.clear_legacy_manifest_hash()
+        self.replay.clear_migration()
 
     def run(self, *, resume: bool = False) -> None:
         pool: multiprocessing.pool.Pool | None = None

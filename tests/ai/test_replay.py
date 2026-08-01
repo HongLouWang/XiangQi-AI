@@ -95,6 +95,122 @@ def test_v1_manifest_is_atomically_migrated_with_counts_and_cursor(
         assert migrated.sample(1, np.random.default_rng(1)).states.shape[0] == 1
 
 
+def test_migration_sidecar_survives_crash_before_manifest_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ReplayBuffer(tmp_path, capacity_games=2).append_game(_game(1))
+    legacy = _downgrade_to_v1(tmp_path)
+    original = ReplayBuffer._write_manifest
+
+    def crash_before_v2(self: ReplayBuffer, manifest: dict[str, object]) -> None:
+        if manifest.get("schema_version") == SCHEMA_VERSION:
+            raise OSError("crash before manifest")
+        original(self, manifest)
+
+    monkeypatch.setattr(ReplayBuffer, "_write_manifest", crash_before_v2)
+    with pytest.raises(OSError, match="crash before manifest"):
+        ReplayBuffer(tmp_path, capacity_games=2)
+
+    assert (tmp_path / "manifest.json").read_bytes() == legacy
+    assert (tmp_path / "migration-v1-to-v2.json").is_file()
+
+    monkeypatch.setattr(ReplayBuffer, "_write_manifest", original)
+    recovered = ReplayBuffer(tmp_path, capacity_games=2)
+    assert recovered.total_games == 1
+    assert recovered.legacy_manifest_hash == hashlib.sha256(legacy).hexdigest()
+
+
+def test_v2_with_valid_sidecar_restores_predecessor_after_restart(
+    tmp_path: Path,
+) -> None:
+    ReplayBuffer(tmp_path, capacity_games=2).append_game(_game(1))
+    legacy = _downgrade_to_v1(tmp_path)
+    migrated = ReplayBuffer(tmp_path, capacity_games=2)
+    assert migrated.migration_path.is_file()
+
+    reopened = ReplayBuffer(tmp_path, capacity_games=2)
+
+    assert reopened.legacy_manifest_hash == hashlib.sha256(legacy).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_field", "bad_hex", "wrong_new_hash", "wrong_total", "bad_type"],
+)
+def test_corrupt_migration_sidecar_is_rejected(tmp_path: Path, corruption: str) -> None:
+    ReplayBuffer(tmp_path, capacity_games=2).append_game(_game(1))
+    _downgrade_to_v1(tmp_path)
+    migrated = ReplayBuffer(tmp_path, capacity_games=2)
+    sidecar = json.loads(migrated.migration_path.read_text())
+    if corruption == "missing_field":
+        sidecar.pop("legacy_manifest_hash")
+    elif corruption == "bad_hex":
+        sidecar["legacy_manifest_hash"] = "xyz"
+    elif corruption == "wrong_new_hash":
+        sidecar["new_manifest_hash"] = "f" * 64
+    elif corruption == "bad_type":
+        sidecar["schema_version"] = True
+    else:
+        sidecar["total_games"] = 999
+    migrated.migration_path.write_text(json.dumps(sidecar))
+
+    with pytest.raises(ReplayCompatibilityError, match="migration|迁移"):
+        ReplayBuffer(tmp_path, capacity_games=2)
+
+
+def test_normal_v2_without_sidecar_has_no_predecessor(tmp_path: Path) -> None:
+    replay = ReplayBuffer(tmp_path, capacity_games=2)
+
+    assert replay.legacy_manifest_hash is None
+    assert not replay.migration_path.exists()
+
+
+def test_sidecar_replace_failure_keeps_v1_manifest_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ReplayBuffer(tmp_path, capacity_games=2).append_game(_game(1))
+    legacy = _downgrade_to_v1(tmp_path)
+    real_replace = os.replace
+
+    def fail_sidecar_replace(source: object, destination: object) -> None:
+        if Path(destination) == tmp_path / "migration-v1-to-v2.json":
+            raise OSError("sidecar replace failed")
+        real_replace(source, destination)
+
+    monkeypatch.setattr("ai.replay.os.replace", fail_sidecar_replace)
+    with pytest.raises(OSError, match="sidecar replace failed"):
+        ReplayBuffer(tmp_path, capacity_games=2)
+
+    assert (tmp_path / "manifest.json").read_bytes() == legacy
+    assert not (tmp_path / "migration-v1-to-v2.json").exists()
+    monkeypatch.setattr("ai.replay.os.replace", real_replace)
+    assert ReplayBuffer(tmp_path, capacity_games=2).total_games == 1
+
+
+def test_sidecar_delete_failure_retains_persisted_retry_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ReplayBuffer(tmp_path, capacity_games=2).append_game(_game(1))
+    _downgrade_to_v1(tmp_path)
+    migrated = ReplayBuffer(tmp_path, capacity_games=2)
+    real_unlink = Path.unlink
+
+    def fail_sidecar_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == migrated.migration_path:
+            raise OSError("sidecar delete failed")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_sidecar_unlink)
+    with pytest.raises(OSError, match="sidecar delete failed"):
+        migrated.clear_migration()
+
+    assert migrated.migration_path.is_file()
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    retry = ReplayBuffer(tmp_path, capacity_games=2)
+    retry.clear_migration()
+    assert not retry.migration_path.exists()
+
+
 @pytest.mark.parametrize(
     "corruption", ["missing_game", "noncontiguous", "payload", "extra_field"]
 )

@@ -41,6 +41,7 @@ class ReplayBuffer:
         self.path = Path(path)
         self.games_path = self.path / "games"
         self.manifest_path = self.path / "manifest.json"
+        self.migration_path = self.path / "migration-v1-to-v2.json"
         self.capacity_games = capacity_games
         self._legacy_manifest_hash: str | None = None
         self.games_path.mkdir(parents=True, exist_ok=True)
@@ -91,7 +92,17 @@ class ReplayBuffer:
         """仅在本对象刚完成 v1 到 v2 迁移时返回旧 manifest 哈希。"""
         return self._legacy_manifest_hash
 
-    def clear_legacy_manifest_hash(self) -> None:
+    def clear_migration(self) -> None:
+        """在新 checkpoint 落盘后耐久撤销旧 checkpoint 的一次性豁免。"""
+        if self.migration_path.exists():
+            payload = self.migration_path.read_bytes()
+            try:
+                self.migration_path.unlink()
+                self._fsync_directory(self.path)
+            except OSError:
+                if not self.migration_path.exists():
+                    self._write_bytes_atomic(self.migration_path, payload)
+                raise
         self._legacy_manifest_hash = None
 
     def append_game(self, game: GameResult) -> int:
@@ -358,6 +369,7 @@ class ReplayBuffer:
             raise ReplayCompatibilityError("Replay manifest 无法读取") from error
         if manifest.get("schema_version") == 1:
             manifest = self._migrate_v1_manifest(manifest, raw)
+            raw = self.manifest_path.read_bytes()
         expected = {
             "schema_version": SCHEMA_VERSION,
             "encoding_version": ENCODING_VERSION,
@@ -404,6 +416,15 @@ class ReplayBuffer:
                 raise ReplayCompatibilityError(
                     f"Replay 棋局 {game_id} 的 sample_count 与 manifest 不一致"
                 )
+        if self.migration_path.exists():
+            sidecar = self._read_migration_sidecar()
+            self._validate_migration_sidecar(
+                sidecar,
+                legacy_hash=None,
+                new_hash=hashlib.sha256(raw).hexdigest(),
+                total_games=total_games,
+            )
+            self._legacy_manifest_hash = str(sidecar["legacy_manifest_hash"])
         return manifest
 
     def _migrate_v1_manifest(
@@ -447,23 +468,112 @@ class ReplayBuffer:
             "total_games": total_games,
             "sample_counts": sample_counts,
         }
-        # 所有旧字段和棋局文件都验证完毕后才原子发布，失败不会触碰 v1 manifest。
+        legacy_hash = hashlib.sha256(raw).hexdigest()
+        new_hash = hashlib.sha256(self._manifest_payload(migrated)).hexdigest()
+        if self.migration_path.exists():
+            sidecar = self._read_migration_sidecar()
+            self._validate_migration_sidecar(
+                sidecar,
+                legacy_hash=legacy_hash,
+                new_hash=new_hash,
+                total_games=total_games,
+            )
+        else:
+            self._write_migration_sidecar(legacy_hash, new_hash, total_games)
+        # sidecar 已耐久发布后才原子发布 manifest；任一步失败都可由下次启动重放。
         self._write_manifest(migrated)
-        self._legacy_manifest_hash = hashlib.sha256(raw).hexdigest()
+        self._legacy_manifest_hash = legacy_hash
         return migrated
 
-    def _write_manifest(self, manifest: dict[str, object]) -> None:
-        payload = json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode(
-            "utf-8"
+    def _write_migration_sidecar(
+        self, legacy_hash: str, new_hash: str, total_games: int
+    ) -> None:
+        sidecar: dict[str, object] = {
+            "schema_version": 1,
+            "legacy_manifest_hash": legacy_hash,
+            "legacy_version": 1,
+            "new_manifest_hash": new_hash,
+            "new_version": SCHEMA_VERSION,
+            "total_games": total_games,
+        }
+        self._write_bytes_atomic(
+            self.migration_path,
+            json.dumps(sidecar, ensure_ascii=False, sort_keys=True).encode("utf-8"),
         )
-        temporary = self._temporary_path(self.path, "manifest.json")
+
+    def _read_migration_sidecar(self) -> dict[str, object]:
+        try:
+            value = json.loads(self.migration_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ReplayCompatibilityError(
+                "Replay migration sidecar 无法读取"
+            ) from error
+        if not isinstance(value, dict):
+            raise ReplayCompatibilityError("Replay migration sidecar 必须是对象")
+        return value
+
+    @staticmethod
+    def _validate_migration_sidecar(
+        sidecar: dict[str, object],
+        *,
+        legacy_hash: str | None,
+        new_hash: str,
+        total_games: int,
+    ) -> None:
+        fields = {
+            "schema_version",
+            "legacy_manifest_hash",
+            "legacy_version",
+            "new_manifest_hash",
+            "new_version",
+            "total_games",
+        }
+        if set(sidecar) != fields:
+            raise ReplayCompatibilityError("Replay migration sidecar 字段无效")
+        hashes = (
+            sidecar.get("legacy_manifest_hash"),
+            sidecar.get("new_manifest_hash"),
+        )
+        if any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+            for value in hashes
+        ):
+            raise ReplayCompatibilityError("Replay migration sidecar hash 无效")
+        if (
+            type(sidecar.get("schema_version")) is not int
+            or sidecar.get("schema_version") != 1
+            or type(sidecar.get("legacy_version")) is not int
+            or sidecar.get("legacy_version") != 1
+            or type(sidecar.get("new_version")) is not int
+            or sidecar.get("new_version") != SCHEMA_VERSION
+            or type(sidecar.get("total_games")) is not int
+            or sidecar.get("total_games") != total_games
+            or sidecar.get("new_manifest_hash") != new_hash
+            or (
+                legacy_hash is not None
+                and sidecar.get("legacy_manifest_hash") != legacy_hash
+            )
+        ):
+            raise ReplayCompatibilityError("Replay migration sidecar 内容不匹配")
+
+    def _write_manifest(self, manifest: dict[str, object]) -> None:
+        self._write_bytes_atomic(self.manifest_path, self._manifest_payload(manifest))
+
+    @staticmethod
+    def _manifest_payload(manifest: dict[str, object]) -> bytes:
+        return json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8")
+
+    def _write_bytes_atomic(self, destination: Path, payload: bytes) -> None:
+        temporary = self._temporary_path(destination.parent, destination.name)
         try:
             with temporary.open("wb") as stream:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.manifest_path)
-            self._fsync_directory(self.path)
+            os.replace(temporary, destination)
+            self._fsync_directory(destination.parent)
         finally:
             temporary.unlink(missing_ok=True)
 

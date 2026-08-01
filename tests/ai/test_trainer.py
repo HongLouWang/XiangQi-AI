@@ -406,6 +406,8 @@ def test_restore_once_accepts_exact_v1_predecessor_and_rewrites_checkpoint(
     )
     assert loaded.replay_manifest_hash == resumed.replay.manifest_hash
     assert loaded.replay_manifest_version == SCHEMA_VERSION
+    assert resumed.replay.legacy_manifest_hash is None
+    assert not resumed.replay.migration_path.exists()
 
 
 def test_v1_predecessor_does_not_allow_an_arbitrary_checkpoint_hash(
@@ -421,6 +423,101 @@ def test_v1_predecessor_does_not_allow_an_arbitrary_checkpoint_hash(
         TrainingProgress(1, 2, 0),
         config,
         replay_manifest_hash="f" * 64,
+        replay_manifest_version=1,
+        numpy_generator=np.random.default_rng(config.seed),
+    )
+
+    with pytest.raises(RuntimeError, match="hash"):
+        Trainer(config, game_factory=one_sample_game).restore()
+
+
+def test_strict_v2_checkpoint_cleans_leftover_migration_sidecar(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, target_games=2)
+    _legacy_v1_replay(tmp_path, one_sample_game(24))
+    replay = ReplayBuffer(tmp_path / "replay", capacity_games=10)
+    model = PolicyValueNetwork(channels=2, residual_blocks=1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    CheckpointManager(tmp_path).save(
+        model,
+        optimizer,
+        TrainingProgress(1, 2, 0),
+        config,
+        replay_manifest_hash=replay.manifest_hash,
+        replay_manifest_version=replay.manifest_version,
+        numpy_generator=np.random.default_rng(config.seed),
+    )
+
+    resumed = Trainer(config, game_factory=one_sample_game)
+    resumed.restore()
+
+    assert not resumed.replay.migration_path.exists()
+
+
+def test_sidecar_delete_failure_keeps_retryable_state_after_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, target_games=2)
+    legacy_hash = _legacy_v1_replay(tmp_path, one_sample_game(24))
+    model = PolicyValueNetwork(channels=2, residual_blocks=1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    CheckpointManager(tmp_path).save(
+        model,
+        optimizer,
+        TrainingProgress(1, 2, 0),
+        config,
+        replay_manifest_hash=legacy_hash,
+        replay_manifest_version=1,
+        numpy_generator=np.random.default_rng(config.seed),
+    )
+    resumed = Trainer(config, game_factory=one_sample_game)
+    monkeypatch.setattr(
+        resumed.replay,
+        "clear_migration",
+        lambda: (_ for _ in ()).throw(OSError("delete failed")),
+    )
+
+    with pytest.raises(OSError, match="delete failed"):
+        resumed.restore()
+
+    assert resumed.replay.migration_path.is_file()
+    CheckpointManager(tmp_path).load_latest(
+        resumed.model,
+        resumed.optimizer,
+        expected_replay_manifest_hash=resumed.replay.manifest_hash,
+        expected_replay_manifest_version=SCHEMA_VERSION,
+        numpy_generator=resumed.rng,
+    )
+    retry = Trainer(config, game_factory=one_sample_game)
+    retry.restore()
+    assert not retry.replay.migration_path.exists()
+
+
+def test_removed_sidecar_never_reauthorizes_legacy_checkpoint(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, target_games=2)
+    legacy_hash = _legacy_v1_replay(tmp_path, one_sample_game(24))
+    model = PolicyValueNetwork(channels=2, residual_blocks=1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    manager = CheckpointManager(tmp_path)
+    manager.save(
+        model,
+        optimizer,
+        TrainingProgress(1, 2, 0),
+        config,
+        replay_manifest_hash=legacy_hash,
+        replay_manifest_version=1,
+        numpy_generator=np.random.default_rng(config.seed),
+    )
+    Trainer(config, game_factory=one_sample_game).restore()
+    manager.save(
+        model,
+        optimizer,
+        TrainingProgress(1, 2, 0),
+        config,
+        replay_manifest_hash=legacy_hash,
         replay_manifest_version=1,
         numpy_generator=np.random.default_rng(config.seed),
     )
