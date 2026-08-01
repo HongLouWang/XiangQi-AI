@@ -15,6 +15,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ai = [
+    "torch>=2.3",
+    "numpy>=1.26",
+]
 dev = [
     "pytest>=8.2",
     "pytest-qt>=4.4",
