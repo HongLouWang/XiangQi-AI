@@ -20,6 +20,46 @@ class CountingEvaluator:
         return np.zeros(ACTION_SIZE, dtype=np.float32), self.value
 
 
+@pytest.mark.parametrize("simulations", [0, -1, 1.5, True])
+def test_simulations_must_be_a_positive_integer(simulations: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="simulations"):
+        MCTS(CountingEvaluator(), simulations=simulations, c_puct=1.5, seed=3)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("c_puct", [-0.1, float("nan"), float("inf"), -float("inf")])
+def test_c_puct_must_be_finite_and_non_negative(c_puct: float) -> None:
+    with pytest.raises(ValueError, match="c_puct"):
+        MCTS(CountingEvaluator(), simulations=1, c_puct=c_puct, seed=3)
+
+
+@pytest.mark.parametrize(
+    "alpha", [0.0, -0.1, float("nan"), float("inf"), -float("inf")]
+)
+def test_dirichlet_alpha_must_be_finite_and_positive(alpha: float) -> None:
+    with pytest.raises(ValueError, match="dirichlet_alpha"):
+        MCTS(
+            CountingEvaluator(),
+            simulations=1,
+            c_puct=1.5,
+            seed=3,
+            dirichlet_alpha=alpha,
+        )
+
+
+@pytest.mark.parametrize(
+    "fraction", [-0.1, 1.1, float("nan"), float("inf"), -float("inf")]
+)
+def test_dirichlet_fraction_must_be_finite_and_in_range(fraction: float) -> None:
+    with pytest.raises(ValueError, match="dirichlet_fraction"):
+        MCTS(
+            CountingEvaluator(),
+            simulations=1,
+            c_puct=1.5,
+            seed=3,
+            dirichlet_fraction=fraction,
+        )
+
+
 def test_search_visits_only_legal_root_moves_and_normalizes_policy() -> None:
     state = SearchState(Board.standard(), Color.RED)
 

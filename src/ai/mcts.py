@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from numbers import Integral, Real
 from typing import Protocol
 
 import numpy as np
@@ -60,14 +61,21 @@ class MCTS:
         dirichlet_alpha: float = 0.3,
         dirichlet_fraction: float = 0.25,
     ) -> None:
-        if simulations <= 0:
-            raise ValueError("simulations 必须大于 0")
+        if (
+            not isinstance(simulations, Integral)
+            or isinstance(simulations, (bool, np.bool_))
+            or simulations <= 0
+        ):
+            raise ValueError("simulations 必须是正整数")
+        self._require_finite_real("c_puct", c_puct)
         if c_puct < 0:
-            raise ValueError("c_puct 不能小于 0")
+            raise ValueError("c_puct 必须是有限的非负数")
+        self._require_finite_real("dirichlet_alpha", dirichlet_alpha)
         if dirichlet_alpha <= 0:
-            raise ValueError("dirichlet_alpha 必须大于 0")
+            raise ValueError("dirichlet_alpha 必须是有限的正数")
+        self._require_finite_real("dirichlet_fraction", dirichlet_fraction)
         if not 0 <= dirichlet_fraction <= 1:
-            raise ValueError("dirichlet_fraction 必须在 0 到 1 之间")
+            raise ValueError("dirichlet_fraction 必须是 0 到 1 之间的有限数")
 
         self.evaluator = evaluator
         self.simulations = simulations
@@ -76,6 +84,15 @@ class MCTS:
         self.dirichlet_fraction = dirichlet_fraction
         self._rng = np.random.default_rng(seed)
         self.root = Node(prior=1.0)
+
+    @staticmethod
+    def _require_finite_real(name: str, value: float) -> None:
+        if (
+            not isinstance(value, Real)
+            or isinstance(value, (bool, np.bool_))
+            or not math.isfinite(value)
+        ):
+            raise ValueError(f"{name} 必须是有限实数")
 
     def search(
         self, state: SearchState, *, add_noise: bool
