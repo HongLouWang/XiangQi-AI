@@ -26,6 +26,15 @@ from ai.self_play import GameResult, play_game
 GameFactory = Callable[[int], GameResult]
 
 
+def _devices_match(requested: torch.device, actual: torch.device) -> bool:
+    """裸 CUDA 接受默认 GPU；显式 CUDA 索引和其他设备严格匹配。"""
+    if requested.type != actual.type:
+        return False
+    if requested.type == "cuda" and requested.index is None:
+        return True
+    return requested == actual
+
+
 class TorchEvaluator:
     """在指定设备执行只读 Policy/Value 推理。"""
 
@@ -33,7 +42,7 @@ class TorchEvaluator:
         if not isinstance(device, torch.device):
             raise TypeError("device 必须是 torch.device")
         tensors = (*model.parameters(), *model.buffers())
-        if any(tensor.device != device for tensor in tensors):
+        if any(not _devices_match(device, tensor.device) for tensor in tensors):
             raise ValueError("model 的全部参数和缓冲区必须位于指定 device")
         self.model = model
         self.device = device

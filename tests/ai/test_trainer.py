@@ -15,7 +15,7 @@ from ai.encoding import ACTION_SIZE, INPUT_CHANNELS
 from ai.mcts import SearchState
 from ai.network import PolicyValueNetwork
 from ai.self_play import GameResult, TrainingSample
-from ai.trainer import TorchEvaluator, Trainer, train_batch
+from ai.trainer import TorchEvaluator, Trainer, _devices_match, train_batch
 from xiangqi.board import Board
 from xiangqi.domain import Color
 
@@ -133,6 +133,25 @@ def test_torch_evaluator_rejects_model_on_a_different_device() -> None:
 
     with pytest.raises(ValueError, match="device"):
         TorchEvaluator(model, torch.device("cpu"))
+
+
+@pytest.mark.parametrize(
+    ("requested", "actual", "expected"),
+    [
+        ("cuda", "cuda:0", True),
+        ("cuda", "cuda:7", True),
+        ("cuda:0", "cuda:0", True),
+        ("cuda:1", "cuda:0", False),
+        ("cuda:0", "cuda", False),
+        ("cpu", "cpu", True),
+        ("cpu", "meta", False),
+        ("cuda", "cpu", False),
+    ],
+)
+def test_device_matching_distinguishes_default_and_explicit_cuda_index(
+    requested: str, actual: str, expected: bool
+) -> None:
+    assert _devices_match(torch.device(requested), torch.device(actual)) is expected
 
 
 @pytest.mark.parametrize(
