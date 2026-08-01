@@ -16,6 +16,7 @@ class TrainingConfig:
     replay_capacity_games: int = 2_000
     learning_rate: float = 1e-3
     checkpoint_interval_games: int = 10
+    game_retry_limit: int = 2
     seed: int = 0
     run_dir: Path = Path("AI-runs/default")
 
@@ -35,6 +36,8 @@ class TrainingConfig:
         for name, value in positive.items():
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} 必须是大于 0 的整数")
+        if type(self.game_retry_limit) is not int or self.game_retry_limit < 0:
+            raise ValueError("game_retry_limit 必须是非负整数")
 
     @property
     def max_plies(self) -> int:

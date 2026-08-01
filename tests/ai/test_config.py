@@ -8,6 +8,7 @@ def test_defaults_are_10000_games_and_512_full_moves() -> None:
     assert config.target_games == 10_000
     assert config.max_full_moves == 512
     assert config.max_plies == 1024
+    assert config.game_retry_limit == 2
 
 
 def test_training_scale_can_be_changed_from_python() -> None:
@@ -35,3 +36,13 @@ def test_training_scale_can_be_changed_from_python() -> None:
 def test_positive_integer_configuration_is_required(field: str, value: object) -> None:
     with pytest.raises(ValueError):
         TrainingConfig(**{field: value})
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True])
+def test_game_retry_limit_is_a_nonnegative_integer(value: object) -> None:
+    with pytest.raises(ValueError):
+        TrainingConfig(game_retry_limit=value)  # type: ignore[arg-type]
+
+
+def test_game_retry_limit_can_disable_retries() -> None:
+    assert TrainingConfig(game_retry_limit=0).game_retry_limit == 0

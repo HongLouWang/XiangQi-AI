@@ -1,3 +1,5 @@
+import json
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -5,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from ai.replay import ReplayBuffer, ReplayCompatibilityError
+from ai.replay import SCHEMA_VERSION, ReplayBuffer, ReplayCompatibilityError
 from ai.self_play import GameResult, TrainingSample
 from xiangqi.domain import Color
 
@@ -36,6 +38,76 @@ def test_replay_commits_complete_games_and_evicts_oldest(tmp_path: Path) -> None
     assert not (tmp_path / "games" / "000000000001.npz").exists()
 
 
+def test_manifest_persists_total_games_and_each_game_sample_count(
+    tmp_path: Path,
+) -> None:
+    replay = ReplayBuffer(tmp_path, capacity_games=2)
+    replay.append_game(_game(1, samples=1))
+    replay.append_game(_game(2, samples=2))
+    replay.append_game(_game(3, samples=3))
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert manifest["total_games"] == 3
+    assert manifest["next_game_id"] == 4
+    assert manifest["sample_counts"] == {"2": 2, "3": 3}
+    assert replay.total_games == 3
+    assert replay.sample_count == 5
+
+
+def test_sample_loads_only_games_selected_for_the_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replay = ReplayBuffer(tmp_path, capacity_games=2_000)
+    replay.append_game(_game(1, samples=1))
+    source = tmp_path / "games" / "000000000001.npz"
+    for game_id in range(2, 2_001):
+        os.link(source, tmp_path / "games" / f"{game_id:012d}.npz")
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    manifest.update(
+        next_game_id=2_001,
+        total_games=2_000,
+        games=list(range(1, 2_001)),
+        sample_counts={str(game_id): 1 for game_id in range(1, 2_001)},
+    )
+    replay._write_manifest(manifest)
+    replay = ReplayBuffer(tmp_path, capacity_games=2_000)
+    loaded: list[int] = []
+    original = replay._read_game
+
+    def track(game_id: int) -> dict[str, np.ndarray]:
+        loaded.append(game_id)
+        return original(game_id)
+
+    monkeypatch.setattr(replay, "_read_game", track)
+
+    replay.sample(8, np.random.default_rng(7))
+
+    assert len(loaded) == len(set(loaded))
+    assert len(loaded) <= 8
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda manifest: manifest.pop("total_games"),
+        lambda manifest: manifest.pop("sample_counts"),
+        lambda manifest: manifest["sample_counts"].update({"1": 999}),
+        lambda manifest: manifest.update(total_games=99),
+    ],
+)
+def test_manifest_rejects_invalid_persisted_counts(
+    tmp_path: Path, mutation: Callable[[dict[str, object]], object]
+) -> None:
+    ReplayBuffer(tmp_path, capacity_games=2).append_game(_game(1))
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text())
+    mutation(manifest)
+    path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ReplayCompatibilityError):
+        ReplayBuffer(tmp_path, capacity_games=2)
+
+
 def test_replay_sample_restores_dense_states_sparse_policies_and_values(
     tmp_path: Path,
 ) -> None:
@@ -61,7 +133,9 @@ def test_replay_rejects_incompatible_manifest(tmp_path: Path) -> None:
     ReplayBuffer(tmp_path, capacity_games=1)
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
-        manifest.read_text().replace('"schema_version": 1', '"schema_version": 99')
+        manifest.read_text().replace(
+            f'"schema_version": {SCHEMA_VERSION}', '"schema_version": 99'
+        )
     )
 
     with pytest.raises(ReplayCompatibilityError, match="schema_version"):

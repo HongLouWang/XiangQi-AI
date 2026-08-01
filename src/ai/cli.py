@@ -30,6 +30,13 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("必须是非负整数")
+    return parsed
+
+
 def _add_run_dir(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--run-dir",
@@ -68,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--replay-capacity-games", type=_positive_int, default=2_000)
     train.add_argument("--learning-rate", type=_positive_float, default=1e-3)
     train.add_argument("--checkpoint-interval-games", type=_positive_int, default=10)
+    train.add_argument("--game-retry-limit", type=_nonnegative_int, default=2)
     train.add_argument("--seed", type=int, default=0)
 
     pause = commands.add_parser("pause", help="请求在安全点暂停训练")
@@ -145,6 +153,7 @@ def _train(args: argparse.Namespace) -> None:
         replay_capacity_games=args.replay_capacity_games,
         learning_rate=args.learning_rate,
         checkpoint_interval_games=args.checkpoint_interval_games,
+        game_retry_limit=args.game_retry_limit,
         seed=args.seed,
         run_dir=args.run_dir,
     )

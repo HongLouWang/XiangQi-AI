@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+from bisect import bisect_right
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -14,7 +15,7 @@ from numpy.typing import NDArray
 from ai.encoding import ACTION_SIZE, INPUT_CHANNELS
 from ai.self_play import GameResult
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ENCODING_VERSION = 1
 ACTION_VERSION = 1
 
@@ -50,7 +51,9 @@ class ReplayBuffer:
                 "encoding_version": ENCODING_VERSION,
                 "action_version": ACTION_VERSION,
                 "next_game_id": 1,
+                "total_games": 0,
                 "games": [],
+                "sample_counts": {},
             }
             self._write_manifest(self._manifest)
 
@@ -64,12 +67,15 @@ class ReplayBuffer:
         return len(self.game_ids)
 
     @property
+    def total_games(self) -> int:
+        """返回历史上已经原子提交的棋局总数，容量淘汰不会减少它。"""
+        return int(self._manifest["total_games"])
+
+    @property
     def sample_count(self) -> int:
         """返回当前持久化 Replay 中可训练局面样本总数。"""
-        return sum(
-            int(self._read_game(game_id)["values"].shape[0])
-            for game_id in self.game_ids
-        )
+        counts = self._manifest["sample_counts"]
+        return sum(int(counts[str(game_id)]) for game_id in self.game_ids)
 
     @property
     def manifest_hash(self) -> str:
@@ -98,7 +104,22 @@ class ReplayBuffer:
         new_games = [*old_games, game_id]
         evicted = new_games[: -self.capacity_games]
         new_games = new_games[-self.capacity_games :]
-        updated = {**self._manifest, "next_game_id": game_id + 1, "games": new_games}
+        old_counts = dict(self._manifest["sample_counts"])
+        sample_counts = {
+            str(retained_id): (
+                len(game.samples)
+                if retained_id == game_id
+                else int(old_counts[str(retained_id)])
+            )
+            for retained_id in new_games
+        }
+        updated = {
+            **self._manifest,
+            "next_game_id": game_id + 1,
+            "total_games": game_id,
+            "games": new_games,
+            "sample_counts": sample_counts,
+        }
         self._write_manifest(updated)
         self._manifest = updated
         for old_id in evicted:
@@ -112,26 +133,36 @@ class ReplayBuffer:
         if not isinstance(rng, np.random.Generator):
             raise TypeError("rng 必须是 numpy.random.Generator")
 
-        locations: list[tuple[int, int]] = []
-        for game_id in self.game_ids:
-            data = self._read_game(game_id)
-            count = int(data["values"].shape[0])
-            locations.extend((game_id, index) for index in range(count))
-        if batch_size > len(locations):
+        counts = [
+            int(self._manifest["sample_counts"][str(game_id)])
+            for game_id in self.game_ids
+        ]
+        cumulative = np.cumsum(counts, dtype=np.int64)
+        total_samples = int(cumulative[-1]) if cumulative.size else 0
+        if batch_size > total_samples:
             raise ValueError(
-                f"样本不足：请求 {batch_size}，Replay 中只有 {len(locations)}"
+                f"样本不足：请求 {batch_size}，Replay 中只有 {total_samples}"
             )
 
-        selected = rng.choice(len(locations), size=batch_size, replace=False)
+        selected = rng.choice(total_samples, size=batch_size, replace=False)
         cache: dict[int, dict[str, NDArray[np.generic]]] = {}
         states: list[NDArray[np.float32]] = []
         indices: list[NDArray[np.int64]] = []
         probabilities: list[NDArray[np.float32]] = []
         values: list[float] = []
         for selection in np.asarray(selected).reshape(-1):
-            game_id, sample_index = locations[int(selection)]
+            flat_index = int(selection)
+            game_offset = bisect_right(cumulative, flat_index)
+            game_id = self.game_ids[game_offset]
+            previous = 0 if game_offset == 0 else int(cumulative[game_offset - 1])
+            sample_index = flat_index - previous
             if game_id not in cache:
                 cache[game_id] = self._read_game(game_id)
+                actual_count = int(cache[game_id]["values"].shape[0])
+                if actual_count != counts[game_offset]:
+                    raise ReplayCompatibilityError(
+                        f"Replay 棋局 {game_id} 的 sample_count 与 manifest 不一致"
+                    )
             data = cache[game_id]
             start = int(data["policy_offsets"][sample_index])
             end = int(data["policy_offsets"][sample_index + 1])
@@ -324,19 +355,40 @@ class ReplayBuffer:
                 )
         games = manifest.get("games")
         next_game_id = manifest.get("next_game_id")
+        total_games = manifest.get("total_games")
+        sample_counts = manifest.get("sample_counts")
         if not isinstance(games, list) or not all(type(item) is int for item in games):
             raise ReplayCompatibilityError("Replay games 清单无效")
         if type(next_game_id) is not int or next_game_id <= 0:
             raise ReplayCompatibilityError("Replay next_game_id 无效")
+        if type(total_games) is not int or total_games < 0:
+            raise ReplayCompatibilityError("Replay total_games 无效")
+        if total_games != next_game_id - 1:
+            raise ReplayCompatibilityError("Replay total_games 与 next_game_id 不一致")
         if (
             any(game_id <= 0 for game_id in games)
             or games != sorted(set(games))
             or (games and next_game_id <= games[-1])
+            or (games and games[-1] != total_games)
+            or games != list(range(total_games - len(games) + 1, total_games + 1))
         ):
             raise ReplayCompatibilityError("Replay 棋局 ID 或 next_game_id 无效")
+        if (
+            not isinstance(sample_counts, dict)
+            or set(sample_counts) != {str(game_id) for game_id in games}
+            or any(
+                type(value) is not int or value <= 0 for value in sample_counts.values()
+            )
+        ):
+            raise ReplayCompatibilityError("Replay sample_counts 清单无效")
         for game_id in games:
             if not self._game_path(game_id).is_file():
                 raise ReplayCompatibilityError(f"Replay 棋局文件缺失：{game_id}")
+            data = self._read_game(game_id)
+            if int(data["values"].shape[0]) != int(sample_counts[str(game_id)]):
+                raise ReplayCompatibilityError(
+                    f"Replay 棋局 {game_id} 的 sample_count 与 manifest 不一致"
+                )
         return manifest
 
     def _write_manifest(self, manifest: dict[str, object]) -> None:

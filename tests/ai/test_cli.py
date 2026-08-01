@@ -102,6 +102,8 @@ def test_train_accepts_runtime_and_network_overrides(
             "0.002",
             "--checkpoint-interval-games",
             "4",
+            "--game-retry-limit",
+            "5",
             "--seed",
             "9",
         ]
@@ -121,6 +123,7 @@ def test_train_accepts_runtime_and_network_overrides(
         replay_capacity_games=40,
         learning_rate=0.002,
         checkpoint_interval_games=4,
+        game_retry_limit=5,
         seed=9,
         run_dir=tmp_path,
     )

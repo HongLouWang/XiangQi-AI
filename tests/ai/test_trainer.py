@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -41,6 +42,15 @@ def pid_game(seed: int) -> GameResult:
 
 def failing_game(seed: int) -> GameResult:
     raise RuntimeError(f"boom-{seed}")
+
+
+def filesystem_flaky_game(seed: int) -> GameResult:
+    marker = Path(os.environ["XIANGQI_RETRY_MARKERS"]) / str(seed)
+    try:
+        marker.touch(exist_ok=False)
+    except FileExistsError:
+        return one_sample_game(seed)
+    raise RuntimeError(f"transient-{seed}")
 
 
 def _config(tmp_path: Path, **changes: object) -> TrainingConfig:
@@ -251,6 +261,92 @@ def test_resume_continues_progress_and_optimizer_instead_of_restarting(
     assert resumed.progress.completed_games == 3
 
 
+@pytest.mark.parametrize("forward_games", [1, 3])
+def test_restore_moves_forward_over_games_committed_after_checkpoint(
+    tmp_path: Path, forward_games: int
+) -> None:
+    config = _config(tmp_path, target_games=1, replay_capacity_games=10)
+    original = Trainer(config, game_factory=one_sample_game)
+    original.run()
+    checkpoint_model = {
+        name: tensor.detach().clone()
+        for name, tensor in original.model.state_dict().items()
+    }
+    for offset in range(forward_games):
+        original.replay.append_game(one_sample_game(100 + offset))
+
+    resumed = Trainer(
+        _config(tmp_path, target_games=forward_games + 2, replay_capacity_games=10),
+        game_factory=one_sample_game,
+    )
+    resumed.restore()
+
+    assert resumed.progress.completed_games == forward_games + 1
+    assert all(
+        torch.equal(checkpoint_model[name], tensor)
+        for name, tensor in resumed.model.state_dict().items()
+    )
+    CheckpointManager(tmp_path).load_latest(
+        resumed.model,
+        resumed.optimizer,
+        expected_config=resumed.config,
+        expected_replay_manifest_hash=resumed.replay.manifest_hash,
+        expected_replay_manifest_version=resumed.replay.manifest_version,
+        numpy_generator=resumed.rng,
+    )
+
+
+def test_restore_uses_total_game_cursor_after_replay_capacity_eviction(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, target_games=1, replay_capacity_games=1)
+    original = Trainer(config, game_factory=one_sample_game)
+    original.run()
+    for seed in (101, 102, 103):
+        original.replay.append_game(one_sample_game(seed))
+
+    resumed = Trainer(
+        _config(tmp_path, target_games=5, replay_capacity_games=1),
+        game_factory=one_sample_game,
+    )
+    resumed.restore()
+
+    assert resumed.replay.game_ids == (4,)
+    assert resumed.progress.completed_games == 4
+
+
+def test_restore_rejects_replay_behind_checkpoint(tmp_path: Path) -> None:
+    trainer = Trainer(_config(tmp_path, target_games=2), game_factory=one_sample_game)
+    trainer.run()
+    manifest_path = tmp_path / "replay" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.update(games=[1], next_game_id=2, total_games=1, sample_counts={"1": 1})
+    manifest_path.write_text(json.dumps(manifest))
+    (tmp_path / "replay" / "games" / "000000000002.npz").unlink()
+
+    with pytest.raises(RuntimeError, match="落后|behind"):
+        Trainer(
+            _config(tmp_path, target_games=3), game_factory=one_sample_game
+        ).restore()
+
+
+def test_forward_restore_generates_the_next_seed_without_repeating_games(
+    tmp_path: Path,
+) -> None:
+    first = Trainer(_config(tmp_path, target_games=1), game_factory=one_sample_game)
+    first.run()
+    first.replay.append_game(one_sample_game(999))
+    seeds: list[int] = []
+
+    def capture(seed: int) -> GameResult:
+        seeds.append(seed)
+        return one_sample_game(seed)
+
+    Trainer(_config(tmp_path, target_games=3), game_factory=capture).run(resume=True)
+
+    assert seeds == [26]
+
+
 def test_pause_is_safe_and_checkpoint_can_be_loaded(tmp_path: Path) -> None:
     def pause_after_complete_game(seed: int) -> GameResult:
         result = one_sample_game(seed)
@@ -405,3 +501,67 @@ def test_game_failure_saves_failed_checkpoint_without_committing_half_game(
     assert status.completed_games == 0
     assert CheckpointManager(tmp_path).has_checkpoint()
     assert not list((tmp_path / "replay" / "games").glob("*.npz"))
+
+
+def test_sequential_worker_retries_with_the_same_seed_then_succeeds(
+    tmp_path: Path,
+) -> None:
+    attempts: list[int] = []
+
+    def flaky(seed: int) -> GameResult:
+        attempts.append(seed)
+        if len(attempts) < 3:
+            raise RuntimeError("temporary")
+        return one_sample_game(seed)
+
+    trainer = Trainer(
+        _config(tmp_path, target_games=1, game_retry_limit=2), game_factory=flaky
+    )
+    trainer.run()
+
+    assert attempts == [24, 24, 24]
+    assert trainer.progress.completed_games == 1
+    assert trainer.replay.total_games == 1
+
+
+def test_spawn_workers_retry_transient_failures_and_preserve_seeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    monkeypatch.setenv("XIANGQI_RETRY_MARKERS", str(markers))
+    trainer = Trainer(
+        _config(
+            tmp_path / "run",
+            target_games=2,
+            self_play_workers=2,
+            game_retry_limit=1,
+        ),
+        game_factory=filesystem_flaky_game,
+    )
+
+    trainer.run()
+
+    assert {path.name for path in markers.iterdir()} == {"24", "25"}
+    assert trainer.replay.total_games == 2
+
+
+def test_retry_exhaustion_records_game_traceback_and_no_partial_replay(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    trainer = Trainer(
+        _config(tmp_path, target_games=1, game_retry_limit=1),
+        game_factory=failing_game,
+    )
+
+    with pytest.raises(RuntimeError, match=r"game 1.*seed 24.*attempt 2"):
+        trainer.run()
+
+    status = RunControl(tmp_path).read_status()
+    assert status.phase == "failed"
+    assert "game 1" in status.message
+    assert "Traceback" in status.message
+    assert "game 1" in caplog.text
+    assert "Traceback" in caplog.text
+    assert CheckpointManager(tmp_path).has_checkpoint()
+    assert trainer.replay.total_games == 0

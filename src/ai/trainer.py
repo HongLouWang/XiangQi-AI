@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import os
 import random
+import traceback
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -24,6 +26,7 @@ from ai.replay import ReplayBatch, ReplayBuffer
 from ai.self_play import GameResult, play_game
 
 GameFactory = Callable[[int], GameResult]
+LOGGER = logging.getLogger(__name__)
 
 
 def _devices_match(requested: torch.device, actual: torch.device) -> bool:
@@ -141,12 +144,19 @@ class _WorkerJob:
     state_dict: dict[str, torch.Tensor]
     seed: int
     game_factory: GameFactory | None
+    game_number: int
+    attempt: int
 
 
 @dataclass(frozen=True, slots=True)
 class _WorkerResult:
     pid: int
-    game: GameResult
+    game: GameResult | None
+    seed: int
+    game_number: int
+    attempt: int
+    error: str = ""
+    traceback: str = ""
 
 
 def _production_game(
@@ -170,15 +180,26 @@ def _production_game(
 
 
 def _worker_entry(job: _WorkerJob) -> _WorkerResult:
-    random.seed(job.seed)
-    np.random.seed(job.seed % (2**32))
-    torch.manual_seed(job.seed)
-    game = (
-        job.game_factory(job.seed)
-        if job.game_factory is not None
-        else _production_game(job.config, job.state_dict, job.seed)
-    )
-    return _WorkerResult(os.getpid(), game)
+    try:
+        random.seed(job.seed)
+        np.random.seed(job.seed % (2**32))
+        torch.manual_seed(job.seed)
+        game = (
+            job.game_factory(job.seed)
+            if job.game_factory is not None
+            else _production_game(job.config, job.state_dict, job.seed)
+        )
+        return _WorkerResult(os.getpid(), game, job.seed, job.game_number, job.attempt)
+    except Exception as error:  # noqa: BLE001 - worker 边界必须序列化失败
+        return _WorkerResult(
+            os.getpid(),
+            None,
+            job.seed,
+            job.game_number,
+            job.attempt,
+            f"{type(error).__name__}: {error}",
+            traceback.format_exc(),
+        )
 
 
 class Trainer:
@@ -225,15 +246,22 @@ class Trainer:
             numpy_generator=self.rng,
             expected_replay_manifest_hash=self.replay.manifest_hash,
             expected_replay_manifest_version=self.replay.manifest_version,
+            allow_replay_forward=True,
+            expected_replay_total_games=self.replay.total_games,
         )
         target = max(loaded.progress.target_games, self.config.target_games)
         if self.control.status_path.exists():
             target = max(target, self.control.read_status().target_games)
+        completed = self.replay.total_games
+        target = max(target, completed)
         self.progress = TrainingProgress(
-            loaded.progress.completed_games,
+            completed,
             target,
             loaded.progress.training_steps,
         )
+        # Replay 的完整棋局可能在上次 checkpoint 后已经原子提交。立即同步新
+        # checkpoint，使下一次恢复重新回到严格 hash 一致状态。
+        self._save_checkpoint()
 
     def run(self, *, resume: bool = False) -> None:
         pool: multiprocessing.pool.Pool | None = None
@@ -252,6 +280,8 @@ class Trainer:
                     results = self._generate_games(count, pool)
                     for result in results:
                         self.worker_pids.add(result.pid)
+                        if result.game is None:  # pragma: no cover - 生成器保证成功
+                            raise AssertionError("成功结果缺少棋局")
                         self._commit_game(result.game)
                         pause = self.control.pause_requested()
                         periodic = (
@@ -297,39 +327,77 @@ class Trainer:
             self.config.seed + self.progress.completed_games + i + 1
             for i in range(count)
         ]
-        if pool is None:
-            if self.game_factory is None:
-                evaluator = TorchEvaluator(self.model, self.device)
-                games = []
-                for seed in seeds:
-                    search = MCTS(
-                        evaluator,
-                        simulations=self.config.simulations_per_move,
-                        c_puct=1.5,
-                        seed=seed,
-                    )
-                    games.append(
-                        _WorkerResult(
-                            os.getpid(),
-                            play_game(
-                                search, max_plies=self.config.max_plies, seed=seed
-                            ),
-                        )
-                    )
-                return games
-            return [
-                _WorkerResult(os.getpid(), self.game_factory(seed)) for seed in seeds
-            ]
-
         state_dict = {
             name: tensor.detach().to("cpu").clone()
             for name, tensor in self.model.state_dict().items()
         }
-        jobs = [
-            _WorkerJob(self.config, state_dict, seed, self.game_factory)
-            for seed in seeds
-        ]
-        return pool.map(_worker_entry, jobs, chunksize=1)
+        pending = {
+            self.progress.completed_games + offset + 1: (seed, 1)
+            for offset, seed in enumerate(seeds)
+        }
+        completed: dict[int, _WorkerResult] = {}
+        while pending:
+            jobs = [
+                _WorkerJob(
+                    self.config,
+                    state_dict,
+                    seed,
+                    self.game_factory,
+                    game_number,
+                    attempt,
+                )
+                for game_number, (seed, attempt) in pending.items()
+            ]
+            if pool is not None:
+                round_results = pool.map(_worker_entry, jobs, chunksize=1)
+            else:
+                round_results = [self._local_worker_entry(job) for job in jobs]
+            next_pending: dict[int, tuple[int, int]] = {}
+            for result in round_results:
+                self.worker_pids.add(result.pid)
+                if result.game is not None:
+                    completed[result.game_number] = result
+                    continue
+                detail = (
+                    f"self-play game {result.game_number} seed {result.seed} "
+                    f"attempt {result.attempt} failed: {result.error}\n"
+                    f"{result.traceback}"
+                )
+                LOGGER.error(detail)
+                if result.attempt > self.config.game_retry_limit:
+                    raise RuntimeError(detail)
+                next_pending[result.game_number] = (result.seed, result.attempt + 1)
+            pending = next_pending
+        return [completed[number] for number in sorted(completed)]
+
+    def _local_worker_entry(self, job: _WorkerJob) -> _WorkerResult:
+        if self.game_factory is not None:
+            return _worker_entry(job)
+        try:
+            random.seed(job.seed)
+            np.random.seed(job.seed % (2**32))
+            torch.manual_seed(job.seed)
+            evaluator = TorchEvaluator(self.model, self.device)
+            search = MCTS(
+                evaluator,
+                simulations=self.config.simulations_per_move,
+                c_puct=1.5,
+                seed=job.seed,
+            )
+            game = play_game(search, max_plies=self.config.max_plies, seed=job.seed)
+            return _WorkerResult(
+                os.getpid(), game, job.seed, job.game_number, job.attempt
+            )
+        except Exception as error:  # noqa: BLE001 - 与 spawn worker 相同协议
+            return _WorkerResult(
+                os.getpid(),
+                None,
+                job.seed,
+                job.game_number,
+                job.attempt,
+                f"{type(error).__name__}: {error}",
+                traceback.format_exc(),
+            )
 
     def _commit_game(self, game: GameResult) -> None:
         self.replay.append_game(game)
