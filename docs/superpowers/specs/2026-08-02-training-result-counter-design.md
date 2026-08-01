@@ -11,15 +11,15 @@ Replay 的红胜、黑胜与和棋局数，同时显示训练进度和无法解�
 默认统计服务器当前主训练目录：
 
 ```bash
-cd /XiangQi-AI/src/ai
-../../.venv/bin/python count_training_results.py
+cd /XiangQi-AI
+.venv/bin/python src/ai/count_training_results.py
 ```
 
 也允许显式指定其他训练目录：
 
 ```bash
-../../.venv/bin/python count_training_results.py \
-  --run-dir AI-runs/cpu-main
+.venv/bin/python src/ai/count_training_results.py \
+  --run-dir src/ai/AI-runs/cpu-main
 ```
 
 `--run-dir` 的默认值为脚本同级的 `AI-runs/cpu-main`。脚本不依赖当前工作目录来

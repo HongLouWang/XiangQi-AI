@@ -204,9 +204,9 @@ git commit -m "完善：增加训练胜负统计命令行输出"
 - [ ] **Step 8: 在服务器只读运行并核对快照**
 
 ```bash
-cd /XiangQi-AI/src/ai
-../../.venv/bin/python count_training_results.py \
-  --run-dir AI-runs/cpu-main
+cd /XiangQi-AI
+.venv/bin/python src/ai/count_training_results.py \
+  --run-dir src/ai/AI-runs/cpu-main
 ```
 
 Expected: 退出码 `0`，胜负和异常之和等于当前保留棋局数；manifest 历史累计局数与
