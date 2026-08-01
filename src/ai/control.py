@@ -180,6 +180,34 @@ class RunControl:
             self._write_status_unlocked(updated)
             return updated
 
+    def try_mark_completed(
+        self,
+        progress: TrainingProgressLike,
+        *,
+        device: str,
+        message: str = "",
+    ) -> bool:
+        """在控制锁内将当前累计目标与完成进度做最终握手。"""
+        with self._locked():
+            current = self.read_status()
+            completed_games = max(progress.completed_games, current.completed_games)
+            training_steps = max(progress.training_steps, current.training_steps)
+            if completed_games > current.target_games:
+                raise ValueError("完成局数不能超过当前累计目标")
+            phase: RunPhase = (
+                "completed" if completed_games == current.target_games else "running"
+            )
+            status = RunStatus(
+                phase=phase,
+                completed_games=completed_games,
+                target_games=current.target_games,
+                training_steps=training_steps,
+                device=device,
+                message=message,
+            )
+            self._write_status_unlocked(status)
+            return phase == "completed"
+
     def _write_status_unlocked(self, status: RunStatus) -> None:
         payload = {"schema_version": STATUS_SCHEMA_VERSION, **asdict(status)}
         self._atomic_write_json(self.status_path, payload)

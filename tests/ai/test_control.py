@@ -121,6 +121,37 @@ def test_extend_adds_to_target_without_resetting_progress(tmp_path: Path) -> Non
     assert updated.target_games == 15
 
 
+def test_completion_handshake_refuses_stale_progress_after_extend(
+    tmp_path: Path,
+) -> None:
+    control = RunControl(tmp_path)
+    control.write_status(RunStatus("running", 1, 1, 1, "cpu"))
+    control.extend(2)
+
+    completed = control.try_mark_completed(
+        TrainingProgress(1, 1, 1), device="cpu", message="workers=1"
+    )
+
+    assert not completed
+    assert control.read_status() == RunStatus(
+        "running", 1, 3, 1, "cpu", "workers=1"
+    )
+
+
+def test_completion_handshake_atomically_marks_current_target(tmp_path: Path) -> None:
+    control = RunControl(tmp_path)
+    control.write_status(RunStatus("running", 3, 3, 2, "cpu"))
+
+    completed = control.try_mark_completed(
+        TrainingProgress(3, 3, 2), device="cpu", message="workers=1"
+    )
+
+    assert completed
+    assert control.read_status() == RunStatus(
+        "completed", 3, 3, 2, "cpu", "workers=1"
+    )
+
+
 def test_stale_write_cannot_reduce_an_extended_target(tmp_path: Path) -> None:
     control = RunControl(tmp_path)
     stale = _running()

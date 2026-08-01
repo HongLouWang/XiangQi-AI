@@ -96,8 +96,98 @@ def test_torch_evaluator_uses_eval_no_grad_and_returns_numpy() -> None:
     assert logits.shape == (ACTION_SIZE,)
     assert logits.dtype == np.float32
     assert isinstance(value, float)
-    assert not model.training
+    assert model.training
     assert all(parameter.grad is None for parameter in model.parameters())
+
+
+@pytest.mark.parametrize("was_training", [True, False])
+def test_torch_evaluator_restores_original_model_mode(was_training: bool) -> None:
+    model = PolicyValueNetwork(channels=2, residual_blocks=1)
+    model.train(was_training)
+
+    TorchEvaluator(model, torch.device("cpu")).evaluate(
+        SearchState(Board.standard(), Color.RED)
+    )
+
+    assert model.training is was_training
+
+
+def test_torch_evaluator_restores_mode_when_forward_fails() -> None:
+    class BrokenModel(torch.nn.Module):
+        def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            raise RuntimeError("inference failed")
+
+    model = BrokenModel()
+    model.train()
+
+    with pytest.raises(RuntimeError, match="inference failed"):
+        TorchEvaluator(model, torch.device("cpu")).evaluate(
+            SearchState(Board.standard(), Color.RED)
+        )
+
+    assert model.training
+
+
+def test_torch_evaluator_rejects_model_on_a_different_device() -> None:
+    model = PolicyValueNetwork(channels=2, residual_blocks=1).to("meta")
+
+    with pytest.raises(ValueError, match="device"):
+        TorchEvaluator(model, torch.device("cpu"))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("indices", np.asarray([], dtype=np.int64)),
+        ("indices", np.asarray([[1]], dtype=np.int64)),
+        ("indices", np.asarray([1.0], dtype=np.float32)),
+        ("indices", np.asarray([-1], dtype=np.int64)),
+        ("indices", np.asarray([ACTION_SIZE], dtype=np.int64)),
+        ("indices", np.asarray([1, 1], dtype=np.int64)),
+        ("probabilities", np.asarray([np.nan], dtype=np.float32)),
+        ("probabilities", np.asarray([-0.1], dtype=np.float32)),
+        ("probabilities", np.asarray([0.8], dtype=np.float32)),
+        ("states", np.full((1, INPUT_CHANNELS, 10, 9), np.nan, dtype=np.float32)),
+        ("values", np.asarray([np.nan], dtype=np.float32)),
+        ("values", np.asarray([1.1], dtype=np.float32)),
+    ],
+)
+def test_train_batch_rejects_invalid_targets_before_forward_or_update(
+    field: str, replacement: np.ndarray
+) -> None:
+    class CountingModel(PolicyValueNetwork):
+        calls = 0
+
+        def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            self.calls += 1
+            return super().forward(inputs)
+
+    model = CountingModel(channels=2, residual_blocks=1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    before = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+    inputs: dict[str, object] = {
+        "states": np.zeros((1, INPUT_CHANNELS, 10, 9), dtype=np.float32),
+        "indices": np.asarray([1], dtype=np.int64),
+        "probabilities": np.asarray([1.0], dtype=np.float32),
+        "values": np.asarray([0.0], dtype=np.float32),
+    }
+    inputs[field] = replacement
+
+    with pytest.raises(ValueError):
+        train_batch(
+            model,
+            optimizer,
+            inputs["states"],  # type: ignore[arg-type]
+            (inputs["indices"],),  # type: ignore[arg-type]
+            (inputs["probabilities"],),  # type: ignore[arg-type]
+            inputs["values"],  # type: ignore[arg-type]
+            torch.device("cpu"),
+        )
+
+    assert model.calls == 0
+    assert all(
+        torch.equal(before[name], tensor) for name, tensor in model.state_dict().items()
+    )
 
 
 def test_trainer_runs_target_and_persists_checkpoint_and_final_model(
@@ -248,6 +338,31 @@ def test_extend_during_finalization_keeps_training(tmp_path: Path) -> None:
     assert status.phase == "completed"
     assert status.completed_games == 2
     assert status.target_games == 2
+
+
+def test_extend_immediately_before_completion_handshake_keeps_training(
+    tmp_path: Path,
+) -> None:
+    trainer = Trainer(
+        _config(tmp_path, target_games=1), game_factory=one_sample_game
+    )
+    original_handshake = trainer.control.try_mark_completed
+    extended = False
+
+    def extend_then_handshake(*args: object, **kwargs: object) -> bool:
+        nonlocal extended
+        if not extended:
+            extended = True
+            RunControl(tmp_path).extend(1)
+        return original_handshake(*args, **kwargs)
+
+    trainer.control.try_mark_completed = extend_then_handshake  # type: ignore[method-assign]
+
+    trainer.run()
+
+    status = RunControl(tmp_path).read_status()
+    assert status.phase == "completed"
+    assert status.completed_games == 2
 
 
 def test_checkpoint_failure_does_not_prevent_failed_status(

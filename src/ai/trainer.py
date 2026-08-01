@@ -30,18 +30,27 @@ class TorchEvaluator:
     """在指定设备执行只读 Policy/Value 推理。"""
 
     def __init__(self, model: nn.Module, device: torch.device) -> None:
+        if not isinstance(device, torch.device):
+            raise TypeError("device 必须是 torch.device")
+        tensors = (*model.parameters(), *model.buffers())
+        if any(tensor.device != device for tensor in tensors):
+            raise ValueError("model 的全部参数和缓冲区必须位于指定 device")
         self.model = model
         self.device = device
 
     def evaluate(
         self, state: SearchState
     ) -> tuple[NDArray[np.float32], float]:
+        was_training = self.model.training
         self.model.eval()
-        inputs = torch.from_numpy(encode_board(state.board, state.side)).unsqueeze(0)
-        with torch.no_grad():
-            logits, values = self.model(inputs.to(self.device))
-        policy = logits[0].detach().to("cpu", dtype=torch.float32).numpy().copy()
-        return policy, float(values.reshape(-1)[0].detach().cpu())
+        try:
+            inputs = torch.from_numpy(encode_board(state.board, state.side)).unsqueeze(0)
+            with torch.no_grad():
+                logits, values = self.model(inputs.to(self.device))
+            policy = logits[0].detach().to("cpu", dtype=torch.float32).numpy().copy()
+            return policy, float(values.reshape(-1)[0].detach().cpu())
+        finally:
+            self.model.train(was_training)
 
 
 def train_batch(
@@ -54,27 +63,58 @@ def train_batch(
     device: torch.device,
 ) -> tuple[float, float]:
     """展开 Replay 的稀疏策略目标并完成一次真实梯度更新。"""
-    state_tensor = torch.as_tensor(states, dtype=torch.float32)
-    value_tensor = torch.as_tensor(value_targets, dtype=torch.float32)
+    state_tensor = torch.as_tensor(states)
+    value_tensor = torch.as_tensor(value_targets)
     if state_tensor.ndim != 4:
         raise ValueError("states 必须是四维 batch")
+    if not bool(torch.isfinite(state_tensor).all()):
+        raise ValueError("states 必须全部为有限数")
     batch_size = int(state_tensor.shape[0])
+    if value_tensor.shape != (batch_size,):
+        raise ValueError("value_targets 必须是一维且与 batch 大小一致")
+    if not bool(torch.isfinite(value_tensor).all()) or bool(
+        ((value_tensor < -1) | (value_tensor > 1)).any()
+    ):
+        raise ValueError("value_targets 必须是 [-1, 1] 内的有限数")
     if len(policy_indices) != batch_size or len(policy_probabilities) != batch_size:
         raise ValueError("稀疏策略数量必须与 batch 大小一致")
     dense_policy = torch.zeros((batch_size, ACTION_SIZE), dtype=torch.float32)
     for row, (indices, probabilities) in enumerate(
         zip(policy_indices, policy_probabilities, strict=True)
     ):
-        index_tensor = torch.as_tensor(indices, dtype=torch.int64)
-        probability_tensor = torch.as_tensor(probabilities, dtype=torch.float32)
-        if index_tensor.ndim != 1 or probability_tensor.shape != index_tensor.shape:
-            raise ValueError("稀疏策略索引与概率必须是一维等长数组")
-        dense_policy[row, index_tensor] = probability_tensor
+        index_tensor = torch.as_tensor(indices)
+        probability_tensor = torch.as_tensor(probabilities)
+        if (
+            index_tensor.ndim != 1
+            or index_tensor.numel() == 0
+            or probability_tensor.shape != index_tensor.shape
+        ):
+            raise ValueError("稀疏策略索引与概率必须是一维、非空且等长")
+        if index_tensor.dtype not in {
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        }:
+            raise ValueError("策略索引必须是整数")
+        if bool(((index_tensor < 0) | (index_tensor >= ACTION_SIZE)).any()):
+            raise ValueError("策略索引越界")
+        indices64 = index_tensor.to(dtype=torch.int64)
+        if torch.unique(indices64).numel() != indices64.numel():
+            raise ValueError("策略索引不能重复")
+        if not bool(torch.isfinite(probability_tensor).all()) or bool(
+            (probability_tensor < 0).any()
+        ):
+            raise ValueError("策略概率必须有限且非负")
+        if not bool(torch.isclose(probability_tensor.sum(), torch.tensor(1.0))):
+            raise ValueError("策略概率之和必须为 1")
+        dense_policy[row, indices64] = probability_tensor.to(dtype=torch.float32)
 
     model.train()
-    logits, values = model(state_tensor.to(device))
+    logits, values = model(state_tensor.to(device=device, dtype=torch.float32))
     policy_targets = dense_policy.to(device)
-    values_target = value_tensor.to(device)
+    values_target = value_tensor.to(device=device, dtype=torch.float32)
     policy_loss = -(
         policy_targets * torch.log_softmax(logits, dim=1)
     ).sum(dim=1).mean()
@@ -224,8 +264,11 @@ class Trainer:
                 self.checkpoints.export_model(
                     self.model, Path(self.config.run_dir) / "final_model.pt"
                 )
-                self._write_status("completed")
-                if self.control.read_status().phase == "completed":
+                if self.control.try_mark_completed(
+                    self.progress,
+                    device=str(self.device),
+                    message=self._worker_message,
+                ):
                     return
                 self._live_target()
                 self._write_status("running")
@@ -335,7 +378,7 @@ class Trainer:
         )
 
     def _write_status(self, phase: str, *, message: str = "") -> None:
-        worker_message = f"self_play_workers_effective={self.worker_count}"
+        worker_message = self._worker_message
         status_message = (
             worker_message if not message else f"{message}; {worker_message}"
         )
@@ -349,3 +392,7 @@ class Trainer:
                 message=status_message,
             )
         )
+
+    @property
+    def _worker_message(self) -> str:
+        return f"self_play_workers_effective={self.worker_count}"
