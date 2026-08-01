@@ -237,6 +237,10 @@ class ReplayBuffer:
         return data
 
     def _encode_game(self, game: GameResult) -> dict[str, NDArray[np.generic]]:
+        if type(game.plies) is not int or game.plies < 0:
+            raise ValueError("棋局 plies 必须是非负整数")
+        if game.plies != len(game.samples):
+            raise ValueError("棋局 plies 必须等于训练样本数")
         states: list[NDArray[np.float32]] = []
         all_indices: list[NDArray[np.int64]] = []
         all_probabilities: list[NDArray[np.float32]] = []
@@ -249,6 +253,8 @@ class ReplayBuffer:
             probabilities = np.asarray(sample.policy_probabilities, dtype=np.float32)
             if state.shape != (INPUT_CHANNELS, 10, 9):
                 raise ValueError(f"局面形状必须是 {(INPUT_CHANNELS, 10, 9)}")
+            if not np.all(np.isfinite(state)):
+                raise ValueError("局面特征必须全部为有限数")
             if (
                 indices.ndim != 1
                 or probabilities.shape != indices.shape
@@ -257,6 +263,8 @@ class ReplayBuffer:
                 raise ValueError("稀疏策略索引和概率必须是一维、非空且等长")
             if np.any(indices < 0) or np.any(indices >= ACTION_SIZE):
                 raise ValueError("策略动作索引越界")
+            if np.unique(indices).size != indices.size:
+                raise ValueError("单个样本的策略动作索引不能重复")
             if not np.all(np.isfinite(probabilities)) or np.any(probabilities < 0):
                 raise ValueError("策略概率必须有限且非负")
             if not np.isclose(float(probabilities.sum()), 1.0, atol=1e-5):

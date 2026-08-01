@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -185,3 +186,33 @@ def test_poisoned_game_payload_is_explicitly_rejected(
 
     with pytest.raises(ReplayCompatibilityError):
         replay.sample(1, np.random.default_rng(0))
+
+
+@pytest.mark.parametrize(
+    "corruption", ["state", "duplicate_action", "negative_plies", "plies_mismatch"]
+)
+def test_append_rejects_invalid_complete_game_before_publishing(
+    tmp_path: Path, corruption: str
+) -> None:
+    game = _game(11)
+    if corruption == "state":
+        sample = replace(
+            game.samples[0], state=np.full((15, 10, 9), np.nan, dtype=np.float32)
+        )
+        game = replace(game, samples=(sample, *game.samples[1:]))
+    elif corruption == "duplicate_action":
+        sample = replace(
+            game.samples[0], policy_indices=np.asarray([11, 11], dtype=np.int64)
+        )
+        game = replace(game, samples=(sample, *game.samples[1:]))
+    elif corruption == "negative_plies":
+        game = replace(game, plies=-1)
+    else:
+        game = replace(game, plies=len(game.samples) + 1)
+    replay = ReplayBuffer(tmp_path, capacity_games=2)
+
+    with pytest.raises(ValueError):
+        replay.append_game(game)
+
+    assert replay.game_ids == ()
+    assert tuple((tmp_path / "games").glob("*.npz")) == ()
