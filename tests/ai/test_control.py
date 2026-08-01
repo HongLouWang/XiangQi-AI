@@ -145,6 +145,28 @@ def test_stale_progress_cannot_reduce_target_when_marking_paused(
     assert control.read_status().target_games == 15
 
 
+def test_stale_running_status_cannot_pause_a_completed_run(tmp_path: Path) -> None:
+    control = RunControl(tmp_path)
+    stale = RunStatus("running", 4, 10, 2, "cpu")
+    control.write_status(RunStatus("completed", 10, 10, 8, "cpu"))
+
+    with pytest.raises(ValueError, match="completed.*暂停"):
+        control.mark_paused(stale)
+
+    assert control.read_status() == RunStatus("completed", 10, 10, 8, "cpu")
+
+
+def test_stale_pause_snapshot_cannot_reduce_completed_games_or_steps(
+    tmp_path: Path,
+) -> None:
+    control = RunControl(tmp_path)
+    control.write_status(RunStatus("pausing", 6, 10, 5, "cpu"))
+
+    paused = control.mark_paused(RunStatus("running", 4, 10, 2, "cpu"))
+
+    assert paused == RunStatus("paused", 6, 10, 5, "cpu")
+
+
 @pytest.mark.parametrize("games", [0, -1, 1.5, True])
 def test_extend_requires_a_positive_integer(tmp_path: Path, games: object) -> None:
     control = RunControl(tmp_path)

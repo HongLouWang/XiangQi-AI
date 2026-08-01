@@ -137,13 +137,13 @@ class RunControl:
     def mark_paused(self, progress: RunStatus | TrainingProgressLike) -> RunStatus:
         with self._locked():
             current = self.read_status()
+            if current.phase not in {"running", "pausing", "paused"}:
+                raise ValueError(f"{current.phase} 阶段不能标记为暂停")
             if isinstance(progress, RunStatus):
                 if progress.phase not in {"running", "pausing", "paused"}:
                     raise ValueError(f"{progress.phase} 阶段不能标记为暂停")
                 paused = replace(progress, phase="paused")
             else:
-                if current.phase not in {"running", "pausing", "paused"}:
-                    raise ValueError(f"{current.phase} 阶段不能标记为暂停")
                 try:
                     paused = RunStatus(
                         phase="paused",
@@ -158,7 +158,10 @@ class RunControl:
                         "progress 必须包含 completed_games、target_games 和 training_steps"
                     ) from error
             paused = replace(
-                paused, target_games=max(paused.target_games, current.target_games)
+                paused,
+                completed_games=max(paused.completed_games, current.completed_games),
+                target_games=max(paused.target_games, current.target_games),
+                training_steps=max(paused.training_steps, current.training_steps),
             )
             self._write_status_unlocked(paused)
             return paused
