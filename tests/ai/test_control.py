@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import multiprocessing
 import os
@@ -14,6 +15,17 @@ from ai.control import RunControl, RunControlError, RunStatus
 def _extend(run_dir: str, games: int, ready: multiprocessing.synchronize.Event) -> None:
     ready.wait()
     RunControl(run_dir).extend(games)
+
+
+def _read_pause(
+    run_dir: str,
+    ready: multiprocessing.synchronize.Event,
+    finished: multiprocessing.synchronize.Event,
+    result: multiprocessing.Queue[bool],
+) -> None:
+    ready.set()
+    result.put(RunControl(run_dir).pause_requested())
+    finished.set()
 
 
 def _running(*, target_games: int = 10) -> RunStatus:
@@ -59,6 +71,33 @@ def test_pause_request_version_is_strictly_validated(tmp_path: Path) -> None:
         control.pause_requested()
 
 
+def test_pause_read_waits_for_clear_lock_and_observes_missing_request(
+    tmp_path: Path,
+) -> None:
+    control = RunControl(tmp_path)
+    control.request_pause()
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    finished = context.Event()
+    result = context.Queue()
+
+    with control.lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        process = context.Process(
+            target=_read_pause,
+            args=(str(tmp_path), ready, finished, result),
+        )
+        process.start()
+        assert ready.wait(timeout=5)
+        assert not finished.wait(timeout=0.3)
+        control.pause_path.unlink()
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    process.join(timeout=5)
+    assert process.exitcode == 0
+    assert result.get(timeout=1) is False
+
+
 def test_mark_paused_accepts_checkpoint_progress_and_preserves_runtime_fields(
     tmp_path: Path,
 ) -> None:
@@ -80,6 +119,30 @@ def test_extend_adds_to_target_without_resetting_progress(tmp_path: Path) -> Non
     assert updated.completed_games == 4
     assert updated.training_steps == 2
     assert updated.target_games == 15
+
+
+def test_stale_write_cannot_reduce_an_extended_target(tmp_path: Path) -> None:
+    control = RunControl(tmp_path)
+    stale = _running()
+    control.write_status(stale)
+    control.extend(5)
+
+    control.write_status(stale)
+
+    assert control.read_status().target_games == 15
+
+
+def test_stale_progress_cannot_reduce_target_when_marking_paused(
+    tmp_path: Path,
+) -> None:
+    control = RunControl(tmp_path)
+    control.write_status(_running())
+    control.extend(5)
+
+    paused = control.mark_paused(TrainingProgress(4, 10, 2))
+
+    assert paused.target_games == 15
+    assert control.read_status().target_games == 15
 
 
 @pytest.mark.parametrize("games", [0, -1, 1.5, True])
@@ -190,6 +253,32 @@ def test_status_fields_are_strictly_validated(kwargs: dict[str, object]) -> None
     values.update(kwargs)
     with pytest.raises((TypeError, ValueError)):
         RunStatus(**values)  # type: ignore[arg-type]
+
+
+def test_completed_phase_requires_progress_to_reach_target() -> None:
+    with pytest.raises(ValueError, match="completed"):
+        RunStatus("completed", 4, 10, 2, "cpu")
+
+
+def test_new_phase_requires_zero_progress() -> None:
+    with pytest.raises(ValueError, match="new"):
+        RunStatus("new", 0, 10, 1, "cpu")
+
+
+@pytest.mark.parametrize("phase", ["new", "completed", "failed"])
+def test_mark_paused_rejects_invalid_source_phase(tmp_path: Path, phase: str) -> None:
+    control = RunControl(tmp_path)
+    status = RunStatus(
+        phase=phase,  # type: ignore[arg-type]
+        completed_games=10 if phase == "completed" else 0,
+        target_games=10,
+        training_steps=0,
+        device="cpu",
+    )
+    control.write_status(status)
+
+    with pytest.raises(ValueError, match="暂停"):
+        control.mark_paused(status)
 
 
 def test_constructor_creates_run_directory(tmp_path: Path) -> None:

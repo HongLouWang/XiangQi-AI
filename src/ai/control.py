@@ -56,6 +56,12 @@ class RunStatus:
                 raise ValueError(f"{name} 必须是非负整数")
         if self.target_games < self.completed_games:
             raise ValueError("target_games 不能小于 completed_games")
+        if self.phase == "completed" and self.completed_games != self.target_games:
+            raise ValueError("completed 阶段必须完成全部目标局数")
+        if self.phase == "new" and (
+            self.completed_games != 0 or self.training_steps != 0
+        ):
+            raise ValueError("new 阶段的完成局数和训练步数必须为 0")
         if type(self.device) is not str or not self.device:
             raise ValueError("device 必须是非空字符串")
         if type(self.message) is not str:
@@ -80,17 +86,18 @@ class RunControl:
             )
 
     def pause_requested(self) -> bool:
-        if not self.pause_path.exists():
-            return False
-        payload = self._read_json(self.pause_path, "暂停请求文件")
-        if (
-            frozenset(payload) != {"schema_version", "requested"}
-            or type(payload["schema_version"]) is not int
-            or payload["schema_version"] != PAUSE_SCHEMA_VERSION
-            or payload["requested"] is not True
-        ):
-            raise RunControlError("暂停请求文件结构或版本无效")
-        return True
+        with self._locked():
+            if not self.pause_path.exists():
+                return False
+            payload = self._read_json(self.pause_path, "暂停请求文件")
+            if (
+                frozenset(payload) != {"schema_version", "requested"}
+                or type(payload["schema_version"]) is not int
+                or payload["schema_version"] != PAUSE_SCHEMA_VERSION
+                or payload["requested"] is not True
+            ):
+                raise RunControlError("暂停请求文件结构或版本无效")
+            return True
 
     def clear_pause(self) -> None:
         with self._locked():
@@ -125,14 +132,18 @@ class RunControl:
         if not isinstance(status, RunStatus):
             raise TypeError("status 必须是 RunStatus")
         with self._locked():
-            self._write_status_unlocked(status)
+            self._write_status_unlocked(self._preserve_extended_target(status))
 
     def mark_paused(self, progress: RunStatus | TrainingProgressLike) -> RunStatus:
         with self._locked():
+            current = self.read_status()
             if isinstance(progress, RunStatus):
+                if progress.phase not in {"running", "pausing", "paused"}:
+                    raise ValueError(f"{progress.phase} 阶段不能标记为暂停")
                 paused = replace(progress, phase="paused")
             else:
-                current = self.read_status()
+                if current.phase not in {"running", "pausing", "paused"}:
+                    raise ValueError(f"{current.phase} 阶段不能标记为暂停")
                 try:
                     paused = RunStatus(
                         phase="paused",
@@ -146,6 +157,9 @@ class RunControl:
                     raise TypeError(
                         "progress 必须包含 completed_games、target_games 和 training_steps"
                     ) from error
+            paused = replace(
+                paused, target_games=max(paused.target_games, current.target_games)
+            )
             self._write_status_unlocked(paused)
             return paused
 
@@ -154,13 +168,27 @@ class RunControl:
             raise ValueError("追加局数必须是正整数")
         with self._locked():
             current = self.read_status()
-            updated = replace(current, target_games=current.target_games + games)
+            phase = "paused" if current.phase == "completed" else current.phase
+            updated = replace(
+                current,
+                phase=phase,
+                target_games=current.target_games + games,
+            )
             self._write_status_unlocked(updated)
             return updated
 
     def _write_status_unlocked(self, status: RunStatus) -> None:
         payload = {"schema_version": STATUS_SCHEMA_VERSION, **asdict(status)}
         self._atomic_write_json(self.status_path, payload)
+
+    def _preserve_extended_target(self, status: RunStatus) -> RunStatus:
+        if not self.status_path.exists():
+            return status
+        current = self.read_status()
+        if current.target_games <= status.target_games:
+            return status
+        phase = current.phase if status.phase == "completed" else status.phase
+        return replace(status, phase=phase, target_games=current.target_games)
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
