@@ -134,6 +134,14 @@ def play_game(
         )
         state = game.play(state, move)
 
+    final_position = game.position(state)
+    if final_position.kind.value != "ongoing":
+        return _finish(
+            pending,
+            final_position.winner,
+            int(max_plies),
+            final_position.kind.value,
+        )
     return _finish(pending, None, int(max_plies), "move_limit")
 
 

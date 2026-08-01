@@ -76,8 +76,23 @@ def test_512_full_moves_means_exactly_1024_plies_without_requesting_more() -> No
     assert result.winner is None
     assert adapter.play_calls == 1024
     assert len(search.calls) == 1024
-    assert adapter.position_calls == list(range(1024))
+    assert adapter.position_calls == list(range(1025))
     assert all(sample.value == 0.0 for sample in result.samples)
+
+
+def test_terminal_result_on_last_allowed_ply_precedes_move_limit_draw() -> None:
+    adapter = LoopingAdapter(terminal_ply=2, winner=Color.RED)
+    search = FixedSearch({0: 1.0})
+
+    result = play_game(search, max_plies=2, adapter=adapter)
+
+    assert result.plies == 2
+    assert result.termination == "checkmate"
+    assert result.winner is Color.RED
+    assert adapter.play_calls == 2
+    assert len(search.calls) == 2
+    assert adapter.position_calls == [0, 1, 2]
+    assert [sample.value for sample in result.samples] == [1.0, -1.0]
 
 
 def test_scripted_winner_is_converted_to_each_sample_side() -> None:
