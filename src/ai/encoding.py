@@ -39,9 +39,7 @@ def encode_board(board: Board, side: Color) -> NDArray[np.float32]:
         raise TypeError("board 必须是 Board")
     _require_side(side)
 
-    encoded = np.zeros(
-        (INPUT_CHANNELS, BOARD_RANKS, BOARD_FILES), dtype=np.float32
-    )
+    encoded = np.zeros((INPUT_CHANNELS, BOARD_RANKS, BOARD_FILES), dtype=np.float32)
     for coord, piece in board.pieces.items():
         viewed = _view(coord, side)
         owner_offset = 0 if piece.color is side else len(_PIECE_TYPES)

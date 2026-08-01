@@ -3,6 +3,62 @@
 一个可在 macOS 上运行的 Python 中国象棋桌面游戏。界面使用 PySide6，
 棋盘始终红方在下、黑方在上。默认红黑双方均由玩家操作，当前版本不接入 AI。
 
+## 独立 AlphaZero 训练
+
+`src/ai` 是独立的中国象棋 AlphaZero 风格训练工具，采用 Policy/Value
+ResNet、PUCT MCTS 和自我对弈循环。它只复用规则引擎来生成合法着法和判断
+将军、将死、困毙；目前**没有接入**桌面 UI、controller 或 HTTP API。训练中的
+每一步都从规则引擎返回的合法着法中选择；若在上限前将死，对局立即按将死
+结束。
+
+安装训练和开发依赖：
+
+```bash
+python -m pip install -e ".[ai,dev]"
+```
+
+默认命令累计训练 10,000 局，每局最多 512 个完整回合。一个完整回合指红方和
+黑方各走一步，因此上限是 1024 ply；到达上限且尚未自然终局时按和棋生成训练
+标签。10,000 局只是可修改的初始训练规模，不是棋力保证：
+
+```bash
+python -m ai train
+python -m ai train --games 20000 --full-moves 512 --device cpu \
+  --torch-threads 8 --self-play-workers 8
+python -m ai train --device cuda:0
+```
+
+`--games` 是该运行目录的累计目标局数，不是每次额外新增的局数。CPU 模式可用
+`--torch-threads` 设置每个 PyTorch 进程的计算线程数，用
+`--self-play-workers` 设置并行自我对弈进程数。GPU 模式接受 `cuda` 或
+`cuda:N`；显式选择 CUDA 而当前 PyTorch/CUDA 不可用时会直接报错，不会静默
+退回 CPU。也可以在 Python 中构造 `TrainingConfig` 修改局数、回合上限、网络
+尺寸、MCTS 模拟次数、batch 和持久化间隔等参数。
+
+默认运行目录为 `AI-runs/default`。Replay 数据、状态和模型均会持久化到该目录：
+
+- `replay/`：按完整棋局原子写入的训练样本及 manifest；
+- `checkpoint-a.pt`、`checkpoint-b.pt`、`latest.json`：安全原子写入、轮换保存
+  的完整断点，包含模型、优化器、训练进度和随机数状态；
+- `final_model.pt`：完成当前累计目标后导出的纯模型权重，可用
+  `torch.load(..., map_location="cpu", weights_only=True)` 安全加载；
+- `status.json`：可供其他进程读取的训练状态。
+
+在已有 checkpoint 的同一目录再次执行 `train` 会自动断点续传，不会清空已有
+模型或 Replay。暂停只会在一局完整提交并安全保存之后生效；恢复、追加累计目标
+和查看状态的命令如下：
+
+```bash
+python -m ai pause --run-dir AI-runs/default
+python -m ai resume --run-dir AI-runs/default
+python -m ai extend --run-dir AI-runs/default --games 5000
+python -m ai status --run-dir AI-runs/default
+```
+
+`extend --games 5000` 会在当前累计目标上再增加 5,000 局，保留已完成局数、
+Replay、模型和优化器状态；若训练进程仍在运行，它会读取新增目标继续训练，若已
+暂停或完成，则随后执行 `resume`。
+
 ## 功能
 
 - 标准中国象棋合法性、将军、将死和困毙判断，每一步走棋后立即检查。

@@ -32,9 +32,7 @@ class SearchState:
 class Evaluator(Protocol):
     """返回动作 logits 和当前行棋方视角局面价值的推理接口。"""
 
-    def evaluate(
-        self, state: SearchState
-    ) -> tuple[NDArray[np.floating], float]: ...
+    def evaluate(self, state: SearchState) -> tuple[NDArray[np.floating], float]: ...
 
 
 @dataclass(slots=True)
@@ -94,9 +92,7 @@ class MCTS:
         ):
             raise ValueError(f"{name} 必须是有限实数")
 
-    def search(
-        self, state: SearchState, *, add_noise: bool
-    ) -> dict[Move, float]:
+    def search(self, state: SearchState, *, add_noise: bool) -> dict[Move, float]:
         self.root = Node(prior=1.0)
 
         root_moves = all_legal_moves(state.board, state.side)
@@ -119,9 +115,7 @@ class MCTS:
                 simulation_state = simulation_state.play(move)
                 path.append(node)
 
-            legal_moves = all_legal_moves(
-                simulation_state.board, simulation_state.side
-            )
+            legal_moves = all_legal_moves(simulation_state.board, simulation_state.side)
             if not legal_moves:
                 leaf_value = -1.0
             else:
@@ -155,10 +149,7 @@ class MCTS:
         def score(item: tuple[Move, Node]) -> float:
             _, child = item
             exploration = (
-                self.c_puct
-                * child.prior
-                * parent_scale
-                / (1 + child.visit_count)
+                self.c_puct * child.prior * parent_scale / (1 + child.visit_count)
             )
             return child.mean_value + exploration
 

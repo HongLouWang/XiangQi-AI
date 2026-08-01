@@ -58,7 +58,15 @@ def test_training_scale_can_be_changed_from_python() -> None:
     assert config.max_plies == 14
 
 
-@pytest.mark.parametrize("field,value", [("target_games", 0), ("max_full_moves", 0), ("self_play_workers", 0), ("torch_threads", 0)])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("target_games", 0),
+        ("max_full_moves", 0),
+        ("self_play_workers", 0),
+        ("torch_threads", 0),
+    ],
+)
 def test_positive_configuration_is_required(field: str, value: int) -> None:
     with pytest.raises(ValueError):
         TrainingConfig(**{field: value})
@@ -149,7 +157,14 @@ git commit -m "功能：增加 AI 训练配置"
 # tests/ai/test_encoding.py
 import numpy as np
 
-from ai.encoding import ACTION_SIZE, INPUT_CHANNELS, decode_action, encode_action, encode_board, legal_policy
+from ai.encoding import (
+    ACTION_SIZE,
+    INPUT_CHANNELS,
+    decode_action,
+    encode_action,
+    encode_board,
+    legal_policy,
+)
 from xiangqi.board import Board
 from xiangqi.domain import Color
 from xiangqi.rules import all_legal_moves
@@ -285,7 +300,9 @@ def test_cpu_device_applies_requested_thread_count() -> None:
     assert torch.get_num_threads() == 2
 
 
-def test_explicit_cuda_fails_instead_of_falling_back(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_explicit_cuda_fails_instead_of_falling_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="CUDA"):
         configure_device("cuda", torch_threads=1)
@@ -311,7 +328,8 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.body = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels), nn.ReLU(),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
         )
@@ -326,11 +344,25 @@ class PolicyValueNetwork(nn.Module):
         super().__init__()
         self.trunk = nn.Sequential(
             nn.Conv2d(INPUT_CHANNELS, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels), nn.ReLU(),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
             *(ResidualBlock(channels) for _ in range(residual_blocks)),
         )
-        self.policy = nn.Sequential(nn.Conv2d(channels, 2, 1), nn.ReLU(), nn.Flatten(), nn.Linear(180, ACTION_SIZE))
-        self.value = nn.Sequential(nn.Conv2d(channels, 1, 1), nn.ReLU(), nn.Flatten(), nn.Linear(90, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
+        self.policy = nn.Sequential(
+            nn.Conv2d(channels, 2, 1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(180, ACTION_SIZE),
+        )
+        self.value = nn.Sequential(
+            nn.Conv2d(channels, 1, 1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(90, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Tanh(),
+        )
 
     def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         trunk = self.trunk(inputs)
@@ -386,7 +418,9 @@ class UniformEvaluator:
 
 def test_search_visits_only_legal_root_moves() -> None:
     state = SearchState(Board.standard(), Color.RED)
-    policy = MCTS(UniformEvaluator(), simulations=8, c_puct=1.5, seed=3).search(state, add_noise=False)
+    policy = MCTS(UniformEvaluator(), simulations=8, c_puct=1.5, seed=3).search(
+        state, add_noise=False
+    )
     legal = {move for move in all_legal_moves(state.board, state.side)}
     assert set(policy) == legal
     assert sum(policy.values()) == 1.0
@@ -414,7 +448,9 @@ class SearchState:
     side: Color
 
     def play(self, move: Move) -> "SearchState":
-        return SearchState(self.board.move_unchecked(move.start, move.end), self.side.opponent)
+        return SearchState(
+            self.board.move_unchecked(move.start, move.end), self.side.opponent
+        )
 
 
 class Evaluator(Protocol):
@@ -462,7 +498,9 @@ from xiangqi.domain import Color
 
 
 def test_512_full_moves_means_exactly_1024_plies() -> None:
-    result = play_game(search=AlwaysFirstLegalSearch(), max_plies=1024, initial_state=LoopingState())
+    result = play_game(
+        search=AlwaysFirstLegalSearch(), max_plies=1024, initial_state=LoopingState()
+    )
     assert result.plies == 1024
     assert result.winner is None
     assert all(sample.value == 0.0 for sample in result.samples)
@@ -553,7 +591,12 @@ def test_replay_commits_complete_games_and_evicts_oldest(tmp_path: Path) -> None
 # tests/ai/test_checkpoint.py
 def test_checkpoint_restores_model_optimizer_progress_and_rng(tmp_path: Path) -> None:
     manager = CheckpointManager(tmp_path)
-    manager.save(model, optimizer, TrainingProgress(completed_games=7, target_games=10, training_steps=3), config)
+    manager.save(
+        model,
+        optimizer,
+        TrainingProgress(completed_games=7, target_games=10, training_steps=3),
+        config,
+    )
     restored = manager.load_latest(model, optimizer)
     assert restored.progress.completed_games == 7
     assert restored.progress.target_games == 10
@@ -616,9 +659,19 @@ def test_pause_request_is_observed_only_at_safe_point(tmp_path: Path) -> None:
     assert control.read_status().phase == "paused"
 
 
-def test_extend_adds_to_cumulative_target_without_resetting_progress(tmp_path: Path) -> None:
+def test_extend_adds_to_cumulative_target_without_resetting_progress(
+    tmp_path: Path,
+) -> None:
     control = RunControl(tmp_path)
-    control.write_status(RunStatus("running", completed_games=4, target_games=10, training_steps=2, device="cpu"))
+    control.write_status(
+        RunStatus(
+            "running",
+            completed_games=4,
+            target_games=10,
+            training_steps=2,
+            device="cpu",
+        )
+    )
     updated = control.extend(5)
     assert updated.completed_games == 4
     assert updated.target_games == 15
@@ -677,7 +730,9 @@ git commit -m "功能：增加训练暂停恢复与追加控制"
 ```python
 # tests/ai/test_trainer.py
 def test_trainer_runs_configured_games_and_saves_checkpoint(tmp_path: Path) -> None:
-    trainer = Trainer(tiny_config(tmp_path, target_games=2), game_factory=one_move_draw_game)
+    trainer = Trainer(
+        tiny_config(tmp_path, target_games=2), game_factory=one_move_draw_game
+    )
     trainer.run()
     status = RunControl(tmp_path).read_status()
     assert status.phase == "completed"
@@ -686,15 +741,22 @@ def test_trainer_runs_configured_games_and_saves_checkpoint(tmp_path: Path) -> N
 
 
 def test_resume_continues_instead_of_restarting(tmp_path: Path) -> None:
-    Trainer(tiny_config(tmp_path, target_games=1), game_factory=one_move_draw_game).run()
+    Trainer(
+        tiny_config(tmp_path, target_games=1), game_factory=one_move_draw_game
+    ).run()
     RunControl(tmp_path).extend(2)
-    resumed = Trainer(tiny_config(tmp_path, target_games=3), game_factory=one_move_draw_game)
+    resumed = Trainer(
+        tiny_config(tmp_path, target_games=3), game_factory=one_move_draw_game
+    )
     resumed.run(resume=True)
     assert RunControl(tmp_path).read_status().completed_games == 3
 
 
 def test_cpu_worker_setting_is_used(tmp_path: Path) -> None:
-    trainer = Trainer(tiny_config(tmp_path, target_games=4, self_play_workers=2), game_factory=recording_game)
+    trainer = Trainer(
+        tiny_config(tmp_path, target_games=4, self_play_workers=2),
+        game_factory=recording_game,
+    )
     trainer.run()
     assert trainer.worker_count == 2
 ```
@@ -710,8 +772,14 @@ Expected: FAIL importing `ai.trainer`.
 def train_batch(model, optimizer, states, policy_targets, value_targets, device):
     model.train()
     logits, values = model(states.to(device))
-    policy_loss = -(policy_targets.to(device) * torch.log_softmax(logits, dim=1)).sum(dim=1).mean()
-    value_loss = torch.nn.functional.mse_loss(values.squeeze(1), value_targets.to(device))
+    policy_loss = (
+        -(policy_targets.to(device) * torch.log_softmax(logits, dim=1))
+        .sum(dim=1)
+        .mean()
+    )
+    value_loss = torch.nn.functional.mse_loss(
+        values.squeeze(1), value_targets.to(device)
+    )
     loss = policy_loss + value_loss
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -750,7 +818,26 @@ git commit -m "功能：实现可续传的自我对弈训练循环"
 # tests/ai/test_cli.py
 def test_train_defaults_and_overrides(monkeypatch, tmp_path: Path) -> None:
     captured = capture_trainer(monkeypatch)
-    assert main(["train", "--run-dir", str(tmp_path), "--games", "12", "--full-moves", "5", "--device", "cpu", "--torch-threads", "3", "--self-play-workers", "2"]) == 0
+    assert (
+        main(
+            [
+                "train",
+                "--run-dir",
+                str(tmp_path),
+                "--games",
+                "12",
+                "--full-moves",
+                "5",
+                "--device",
+                "cpu",
+                "--torch-threads",
+                "3",
+                "--self-play-workers",
+                "2",
+            ]
+        )
+        == 0
+    )
     assert captured.config.target_games == 12
     assert captured.config.max_plies == 10
     assert captured.config.torch_threads == 3

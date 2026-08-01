@@ -23,9 +23,11 @@ def test_action_round_trip_for_every_standard_legal_move(side: Color) -> None:
 
 
 def test_black_view_rotates_coordinates_and_makes_black_friendly() -> None:
-    board = Board.empty().place(
-        Coord(1, 2), Piece(Color.BLACK, PieceType.HORSE)
-    ).place(Coord(4, 8), Piece(Color.RED, PieceType.ROOK))
+    board = (
+        Board.empty()
+        .place(Coord(1, 2), Piece(Color.BLACK, PieceType.HORSE))
+        .place(Coord(4, 8), Piece(Color.RED, PieceType.ROOK))
+    )
 
     encoded = encode_board(board, Color.BLACK)
 

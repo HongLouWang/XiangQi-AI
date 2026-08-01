@@ -67,7 +67,9 @@ def test_train_batch_expands_sparse_policy_and_really_updates_weights() -> None:
     torch.manual_seed(1)
     model = PolicyValueNetwork(channels=2, residual_blocks=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    before = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+    before = {
+        name: tensor.detach().clone() for name, tensor in model.state_dict().items()
+    }
 
     policy_loss, value_loss = train_batch(
         model,
@@ -183,7 +185,9 @@ def test_train_batch_rejects_invalid_targets_before_forward_or_update(
 
     model = CountingModel(channels=2, residual_blocks=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    before = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+    before = {
+        name: tensor.detach().clone() for name, tensor in model.state_dict().items()
+    }
     inputs: dict[str, object] = {
         "states": np.zeros((1, INPUT_CHANNELS, 10, 9), dtype=np.float32),
         "indices": np.asarray([1], dtype=np.int64),
@@ -229,15 +233,11 @@ def test_trainer_runs_target_and_persists_checkpoint_and_final_model(
 def test_resume_continues_progress_and_optimizer_instead_of_restarting(
     tmp_path: Path,
 ) -> None:
-    Trainer(
-        _config(tmp_path, target_games=1), game_factory=one_sample_game
-    ).run()
+    Trainer(_config(tmp_path, target_games=1), game_factory=one_sample_game).run()
     first = RunControl(tmp_path).read_status()
     RunControl(tmp_path).extend(2)
 
-    resumed = Trainer(
-        _config(tmp_path, target_games=3), game_factory=one_sample_game
-    )
+    resumed = Trainer(_config(tmp_path, target_games=3), game_factory=one_sample_game)
     resumed.run(resume=True)
 
     status = RunControl(tmp_path).read_status()
@@ -265,9 +265,7 @@ def test_pause_is_safe_and_checkpoint_can_be_loaded(tmp_path: Path) -> None:
     status = RunControl(tmp_path).read_status()
     assert status.phase == "paused"
     assert status.completed_games == 1
-    restored = Trainer(
-        _config(tmp_path, target_games=5), game_factory=one_sample_game
-    )
+    restored = Trainer(_config(tmp_path, target_games=5), game_factory=one_sample_game)
     restored.restore()
     assert restored.progress == trainer.progress
 
@@ -335,9 +333,7 @@ def test_small_replay_commits_progress_before_training_is_possible(
 
 
 def test_extend_during_finalization_keeps_training(tmp_path: Path) -> None:
-    trainer = Trainer(
-        _config(tmp_path, target_games=1), game_factory=one_sample_game
-    )
+    trainer = Trainer(_config(tmp_path, target_games=1), game_factory=one_sample_game)
     original_export = trainer.checkpoints.export_model
     extended = False
 
@@ -362,9 +358,7 @@ def test_extend_during_finalization_keeps_training(tmp_path: Path) -> None:
 def test_extend_immediately_before_completion_handshake_keeps_training(
     tmp_path: Path,
 ) -> None:
-    trainer = Trainer(
-        _config(tmp_path, target_games=1), game_factory=one_sample_game
-    )
+    trainer = Trainer(_config(tmp_path, target_games=1), game_factory=one_sample_game)
     original_handshake = trainer.control.try_mark_completed
     extended = False
 

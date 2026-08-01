@@ -113,9 +113,7 @@ def play_game(
     for ply in range(int(max_plies)):
         position = game.position(state)
         if position.kind.value != "ongoing":
-            return _finish(
-                pending, position.winner, ply, position.kind.value
-            )
+            return _finish(pending, position.winner, ply, position.kind.value)
 
         policy = search.search(state, add_noise=True)
         move, indices, probabilities = _select_move(
@@ -129,9 +127,7 @@ def play_game(
         encoded_state.setflags(write=False)
         indices.setflags(write=False)
         probabilities.setflags(write=False)
-        pending.append(
-            (encoded_state, indices, probabilities, game.side(state))
-        )
+        pending.append((encoded_state, indices, probabilities, game.side(state)))
         state = game.play(state, move)
 
     final_position = game.position(state)

@@ -133,9 +133,7 @@ def test_completion_handshake_refuses_stale_progress_after_extend(
     )
 
     assert not completed
-    assert control.read_status() == RunStatus(
-        "running", 1, 3, 1, "cpu", "workers=1"
-    )
+    assert control.read_status() == RunStatus("running", 1, 3, 1, "cpu", "workers=1")
 
 
 def test_completion_handshake_atomically_marks_current_target(tmp_path: Path) -> None:
@@ -147,9 +145,7 @@ def test_completion_handshake_atomically_marks_current_target(tmp_path: Path) ->
     )
 
     assert completed
-    assert control.read_status() == RunStatus(
-        "completed", 3, 3, 2, "cpu", "workers=1"
-    )
+    assert control.read_status() == RunStatus("completed", 3, 3, 2, "cpu", "workers=1")
 
 
 def test_stale_write_cannot_reduce_an_extended_target(tmp_path: Path) -> None:

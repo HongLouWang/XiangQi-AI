@@ -47,13 +47,13 @@ class TorchEvaluator:
         self.model = model
         self.device = device
 
-    def evaluate(
-        self, state: SearchState
-    ) -> tuple[NDArray[np.float32], float]:
+    def evaluate(self, state: SearchState) -> tuple[NDArray[np.float32], float]:
         was_training = self.model.training
         self.model.eval()
         try:
-            inputs = torch.from_numpy(encode_board(state.board, state.side)).unsqueeze(0)
+            inputs = torch.from_numpy(encode_board(state.board, state.side)).unsqueeze(
+                0
+            )
             with torch.no_grad():
                 logits, values = self.model(inputs.to(self.device))
             policy = logits[0].detach().to("cpu", dtype=torch.float32).numpy().copy()
@@ -124,9 +124,7 @@ def train_batch(
     logits, values = model(state_tensor.to(device=device, dtype=torch.float32))
     policy_targets = dense_policy.to(device)
     values_target = value_tensor.to(device=device, dtype=torch.float32)
-    policy_loss = -(
-        policy_targets * torch.log_softmax(logits, dim=1)
-    ).sum(dim=1).mean()
+    policy_loss = -(policy_targets * torch.log_softmax(logits, dim=1)).sum(dim=1).mean()
     value_loss = torch.nn.functional.mse_loss(
         values.reshape(-1), values_target.reshape(-1)
     )
@@ -295,7 +293,10 @@ class Trainer:
     def _generate_games(
         self, count: int, pool: multiprocessing.pool.Pool | None
     ) -> list[_WorkerResult]:
-        seeds = [self.config.seed + self.progress.completed_games + i + 1 for i in range(count)]
+        seeds = [
+            self.config.seed + self.progress.completed_games + i + 1
+            for i in range(count)
+        ]
         if pool is None:
             if self.game_factory is None:
                 evaluator = TorchEvaluator(self.model, self.device)
@@ -367,7 +368,9 @@ class Trainer:
     def _live_target(self) -> int:
         if not self.control.status_path.exists():
             return self.progress.target_games
-        target = max(self.progress.target_games, self.control.read_status().target_games)
+        target = max(
+            self.progress.target_games, self.control.read_status().target_games
+        )
         if target != self.progress.target_games:
             self.progress = TrainingProgress(
                 self.progress.completed_games, target, self.progress.training_steps

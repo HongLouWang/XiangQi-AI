@@ -63,9 +63,9 @@ def test_dirichlet_fraction_must_be_finite_and_in_range(fraction: float) -> None
 def test_search_visits_only_legal_root_moves_and_normalizes_policy() -> None:
     state = SearchState(Board.standard(), Color.RED)
 
-    policy = MCTS(
-        CountingEvaluator(), simulations=8, c_puct=1.5, seed=3
-    ).search(state, add_noise=False)
+    policy = MCTS(CountingEvaluator(), simulations=8, c_puct=1.5, seed=3).search(
+        state, add_noise=False
+    )
 
     assert set(policy) == set(all_legal_moves(state.board, state.side))
     assert sum(policy.values()) == pytest.approx(1.0)
@@ -84,9 +84,7 @@ def test_search_executes_exactly_the_requested_simulation_count() -> None:
 def test_one_simulation_visits_one_root_edge() -> None:
     search = MCTS(CountingEvaluator(), simulations=1, c_puct=1.5, seed=3)
 
-    policy = search.search(
-        SearchState(Board.standard(), Color.RED), add_noise=False
-    )
+    policy = search.search(SearchState(Board.standard(), Color.RED), add_noise=False)
 
     assert sum(child.visit_count for child in search.root.children.values()) == 1
     assert sum(policy.values()) == pytest.approx(1.0)
@@ -115,9 +113,7 @@ def test_real_move_advances_board_and_changes_side() -> None:
 
 def test_terminal_state_does_not_call_evaluator() -> None:
     evaluator = CountingEvaluator()
-    terminal = SearchState(
-        Board.from_fen("4k4/3RRR3/9/9/9/9/9/9/9/4K4"), Color.BLACK
-    )
+    terminal = SearchState(Board.from_fen("4k4/3RRR3/9/9/9/9/9/9/9/4K4"), Color.BLACK)
 
     search = MCTS(evaluator, simulations=4, c_puct=1.5, seed=3)
     policy = search.search(terminal, add_noise=False)
@@ -155,9 +151,7 @@ def test_illegal_high_logit_is_excluded_before_root_prior_softmax() -> None:
             logits[illegal_index] = 1000.0
             return logits, 0.0
 
-    search = MCTS(
-        IllegalBiasedEvaluator(), simulations=1, c_puct=1.5, seed=3
-    )
+    search = MCTS(IllegalBiasedEvaluator(), simulations=1, c_puct=1.5, seed=3)
 
     search.search(state, add_noise=False)
 
@@ -170,9 +164,7 @@ def test_illegal_high_logit_is_excluded_before_root_prior_softmax() -> None:
 
 def test_root_dirichlet_noise_is_used_only_when_requested() -> None:
     state = SearchState(Board.standard(), Color.RED)
-    without_noise = MCTS(
-        CountingEvaluator(), simulations=1, c_puct=1.5, seed=3
-    )
+    without_noise = MCTS(CountingEvaluator(), simulations=1, c_puct=1.5, seed=3)
     with_noise = MCTS(
         CountingEvaluator(),
         simulations=1,

@@ -176,9 +176,7 @@ def test_max_plies_must_be_a_positive_integer(max_plies: object) -> None:
 
 
 def test_default_adapter_uses_real_board_and_rules_for_terminal_position() -> None:
-    terminal = SearchState(
-        Board.from_fen("4k4/3RRR3/9/9/9/9/9/9/9/4K4"), Color.BLACK
-    )
+    terminal = SearchState(Board.from_fen("4k4/3RRR3/9/9/9/9/9/9/9/4K4"), Color.BLACK)
 
     result = play_game(FixedSearch(), initial_state=terminal)
 
@@ -188,9 +186,7 @@ def test_default_adapter_uses_real_board_and_rules_for_terminal_position() -> No
 
 
 def test_real_rules_fill_winner_value_after_a_checkmating_move() -> None:
-    state = SearchState(
-        Board.from_fen("4k4/4RR3/3R5/9/9/9/9/9/9/4K4"), Color.RED
-    )
+    state = SearchState(Board.from_fen("4k4/4RR3/3R5/9/9/9/9/9/9/4K4"), Color.RED)
     move = next(
         move
         for move in all_legal_moves(state.board, state.side)
@@ -199,9 +195,7 @@ def test_real_rules_fill_winner_value_after_a_checkmating_move() -> None:
     )
 
     class CheckmatingSearch:
-        def search(
-            self, state: SearchState, *, add_noise: bool
-        ) -> dict[object, float]:
+        def search(self, state: SearchState, *, add_noise: bool) -> dict[object, float]:
             return {move: 1.0}
 
     result = play_game(CheckmatingSearch(), initial_state=state)

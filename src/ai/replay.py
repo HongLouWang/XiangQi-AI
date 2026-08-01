@@ -59,6 +59,19 @@ class ReplayBuffer:
         return tuple(self._manifest["games"])
 
     @property
+    def game_count(self) -> int:
+        """返回当前持久化 Replay 中的完整棋局数量。"""
+        return len(self.game_ids)
+
+    @property
+    def sample_count(self) -> int:
+        """返回当前持久化 Replay 中可训练局面样本总数。"""
+        return sum(
+            int(self._read_game(game_id)["values"].shape[0])
+            for game_id in self.game_ids
+        )
+
+    @property
     def manifest_hash(self) -> str:
         return hashlib.sha256(self.manifest_path.read_bytes()).hexdigest()
 
