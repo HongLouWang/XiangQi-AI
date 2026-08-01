@@ -288,6 +288,18 @@ def test_replay_manifest_mismatch_is_explicitly_rejected(tmp_path: Path) -> None
         )
 
 
+def test_replay_manifest_version_is_checked_without_an_expected_hash(
+    tmp_path: Path,
+) -> None:
+    model, optimizer = _objects()
+    config = TrainingConfig(channels=4, residual_blocks=1, run_dir=tmp_path)
+    manager = CheckpointManager(tmp_path)
+    _save(manager, model, optimizer, TrainingProgress(1, 10_000, 1), config)
+
+    with pytest.raises(CheckpointCompatibilityError, match="version"):
+        manager.load_latest(*_objects(), expected_replay_manifest_version=99)
+
+
 def test_scheduler_state_round_trips_from_disk(tmp_path: Path) -> None:
     model, optimizer = _objects()
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)

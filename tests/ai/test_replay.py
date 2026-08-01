@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from collections.abc import Callable
@@ -26,6 +27,24 @@ def _game(marker: int, samples: int = 2) -> GameResult:
     return GameResult(entries, Color.RED, samples, "checkmate")
 
 
+def _downgrade_to_v1(path: Path) -> bytes:
+    manifest_path = path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["schema_version"] = 1
+    manifest.pop("total_games")
+    manifest.pop("sample_counts")
+    for game_id in manifest["games"]:
+        game_path = path / "games" / f"{game_id:012d}.npz"
+        with np.load(game_path, allow_pickle=False) as stored:
+            payload = {key: stored[key] for key in stored.files}
+        payload["schema_version"] = np.asarray([1], dtype=np.int64)
+        with game_path.open("wb") as stream:
+            np.savez_compressed(stream, **payload)
+    legacy = json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode()
+    manifest_path.write_bytes(legacy)
+    return legacy
+
+
 def test_replay_commits_complete_games_and_evicts_oldest(tmp_path: Path) -> None:
     replay = ReplayBuffer(tmp_path, capacity_games=2)
 
@@ -52,6 +71,60 @@ def test_manifest_persists_total_games_and_each_game_sample_count(
     assert manifest["sample_counts"] == {"2": 2, "3": 3}
     assert replay.total_games == 3
     assert replay.sample_count == 5
+
+
+@pytest.mark.parametrize(("games", "capacity"), [(0, 2), (3, 1)])
+def test_v1_manifest_is_atomically_migrated_with_counts_and_cursor(
+    tmp_path: Path, games: int, capacity: int
+) -> None:
+    replay = ReplayBuffer(tmp_path, capacity_games=capacity)
+    for marker in range(1, games + 1):
+        replay.append_game(_game(marker, samples=marker))
+    legacy = _downgrade_to_v1(tmp_path)
+
+    migrated = ReplayBuffer(tmp_path, capacity_games=capacity)
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+
+    assert migrated.legacy_manifest_hash == hashlib.sha256(legacy).hexdigest()
+    assert manifest["schema_version"] == SCHEMA_VERSION
+    assert manifest["total_games"] == games
+    assert migrated.total_games == games
+    assert migrated.game_ids == (() if games == 0 else (games,))
+    assert manifest["sample_counts"] == ({} if games == 0 else {str(games): games})
+    if games:
+        assert migrated.sample(1, np.random.default_rng(1)).states.shape[0] == 1
+
+
+@pytest.mark.parametrize(
+    "corruption", ["missing_game", "noncontiguous", "payload", "extra_field"]
+)
+def test_corrupt_v1_is_rejected_without_rewriting_manifest(
+    tmp_path: Path, corruption: str
+) -> None:
+    replay = ReplayBuffer(tmp_path, capacity_games=2)
+    replay.append_game(_game(1))
+    legacy = _downgrade_to_v1(tmp_path)
+    if corruption == "missing_game":
+        (tmp_path / "games" / "000000000001.npz").unlink()
+    elif corruption == "noncontiguous":
+        manifest = json.loads(legacy)
+        manifest["games"] = [2]
+        legacy = json.dumps(manifest, sort_keys=True).encode()
+        (tmp_path / "manifest.json").write_bytes(legacy)
+    elif corruption == "extra_field":
+        manifest = json.loads(legacy)
+        manifest["sample_counts"] = {"1": 2}
+        legacy = json.dumps(manifest, sort_keys=True).encode()
+        (tmp_path / "manifest.json").write_bytes(legacy)
+    else:
+        game_path = tmp_path / "games" / "000000000001.npz"
+        game_path.write_bytes(b"not npz")
+
+    before = (tmp_path / "manifest.json").read_bytes()
+    with pytest.raises(ReplayCompatibilityError):
+        ReplayBuffer(tmp_path, capacity_games=2)
+
+    assert (tmp_path / "manifest.json").read_bytes() == before
 
 
 def test_sample_loads_only_games_selected_for_the_batch(

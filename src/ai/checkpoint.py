@@ -138,6 +138,7 @@ class CheckpointManager:
         expected_replay_manifest_version: int | None = None,
         allow_replay_forward: bool = False,
         expected_replay_total_games: int | None = None,
+        accepted_replay_predecessor_hash: str | None = None,
     ) -> LoadedCheckpoint:
         errors: list[str] = []
         compatibility_errors: list[CheckpointCompatibilityError] = []
@@ -163,6 +164,7 @@ class CheckpointManager:
                 expected_replay_manifest_version,
                 allow_replay_forward,
                 expected_replay_total_games,
+                accepted_replay_predecessor_hash,
             )
             snapshots = self._capture_restore_snapshots(
                 model, optimizer, scheduler, numpy_generator
@@ -276,6 +278,7 @@ class CheckpointManager:
         expected_replay_manifest_version: int | None,
         allow_replay_forward: bool,
         expected_replay_total_games: int | None,
+        accepted_replay_predecessor_hash: str | None,
     ) -> None:
         if expected_config is not None:
             for name in ("channels", "residual_blocks"):
@@ -285,16 +288,38 @@ class CheckpointManager:
                     raise CheckpointCompatibilityError(
                         f"checkpoint {name} 不兼容：{actual} != {expected}"
                     )
-        if (
-            expected_replay_manifest_version is not None
-            and loaded.replay_manifest_version != expected_replay_manifest_version
-        ):
-            raise CheckpointCompatibilityError(
-                "checkpoint 与当前 Replay manifest version 不一致"
-            )
         if expected_replay_manifest_hash is None:
+            if (
+                expected_replay_manifest_version is not None
+                and loaded.replay_manifest_version != expected_replay_manifest_version
+            ):
+                raise CheckpointCompatibilityError(
+                    "checkpoint 与当前 Replay manifest version 不一致"
+                )
             return
-        if loaded.replay_manifest_hash == expected_replay_manifest_hash:
+        exact_current = loaded.replay_manifest_hash == expected_replay_manifest_hash
+        exact_predecessor = (
+            accepted_replay_predecessor_hash is not None
+            and loaded.replay_manifest_hash == accepted_replay_predecessor_hash
+        )
+        if exact_current:
+            if (
+                expected_replay_manifest_version is not None
+                and loaded.replay_manifest_version != expected_replay_manifest_version
+            ):
+                raise CheckpointCompatibilityError(
+                    "checkpoint 与当前 Replay manifest version 不一致"
+                )
+            return
+        if exact_predecessor:
+            if (
+                loaded.replay_manifest_version != 1
+                or type(expected_replay_total_games) is not int
+                or expected_replay_total_games != loaded.progress.completed_games
+            ):
+                raise CheckpointCompatibilityError(
+                    "旧 Replay manifest 只允许等进度的一次性迁移恢复"
+                )
             return
         if not allow_replay_forward:
             raise CheckpointCompatibilityError(

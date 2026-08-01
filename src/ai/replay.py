@@ -42,6 +42,7 @@ class ReplayBuffer:
         self.games_path = self.path / "games"
         self.manifest_path = self.path / "manifest.json"
         self.capacity_games = capacity_games
+        self._legacy_manifest_hash: str | None = None
         self.games_path.mkdir(parents=True, exist_ok=True)
         if self.manifest_path.exists():
             self._manifest = self._read_manifest()
@@ -84,6 +85,14 @@ class ReplayBuffer:
     @property
     def manifest_version(self) -> int:
         return SCHEMA_VERSION
+
+    @property
+    def legacy_manifest_hash(self) -> str | None:
+        """仅在本对象刚完成 v1 到 v2 迁移时返回旧 manifest 哈希。"""
+        return self._legacy_manifest_hash
+
+    def clear_legacy_manifest_hash(self) -> None:
+        self._legacy_manifest_hash = None
 
     def append_game(self, game: GameResult) -> int:
         game_id = int(self._manifest["next_game_id"])
@@ -181,18 +190,20 @@ class ReplayBuffer:
             values=np.asarray(values, dtype=np.float32),
         )
 
-    def _read_game(self, game_id: int) -> dict[str, NDArray[np.generic]]:
+    def _read_game(
+        self, game_id: int, *, schema_versions: tuple[int, ...] = (1, 2)
+    ) -> dict[str, NDArray[np.generic]]:
         try:
             with np.load(self._game_path(game_id), allow_pickle=False) as stored:
                 data = {key: stored[key].copy() for key in stored.files}
         except (OSError, ValueError, KeyError) as error:
             raise ReplayCompatibilityError(f"Replay 棋局 {game_id} 无法读取") from error
         expected = {
-            "schema_version": SCHEMA_VERSION,
-            "encoding_version": ENCODING_VERSION,
-            "action_version": ACTION_VERSION,
+            "encoding_version": (ENCODING_VERSION,),
+            "action_version": (ACTION_VERSION,),
+            "schema_version": schema_versions,
         }
-        for name, version in expected.items():
+        for name, accepted_versions in expected.items():
             try:
                 version_array = np.asarray(data[name])
                 if version_array.shape != (1,) or not np.issubdtype(
@@ -204,9 +215,10 @@ class ReplayBuffer:
                 raise ReplayCompatibilityError(
                     f"Replay 棋局 {game_id} 缺少有效 {name}"
                 ) from error
-            if actual != version:
+            if actual not in accepted_versions:
                 raise ReplayCompatibilityError(
-                    f"Replay 棋局 {game_id} 的 {name} 不兼容：{actual} != {version}"
+                    f"Replay 棋局 {game_id} 的 {name} 不兼容："
+                    f"{actual} not in {accepted_versions}"
                 )
         required = {
             "states",
@@ -340,9 +352,12 @@ class ReplayBuffer:
 
     def _read_manifest(self) -> dict[str, object]:
         try:
-            manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            raw = self.manifest_path.read_bytes()
+            manifest = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ReplayCompatibilityError("Replay manifest 无法读取") from error
+        if manifest.get("schema_version") == 1:
+            manifest = self._migrate_v1_manifest(manifest, raw)
         expected = {
             "schema_version": SCHEMA_VERSION,
             "encoding_version": ENCODING_VERSION,
@@ -390,6 +405,52 @@ class ReplayBuffer:
                     f"Replay 棋局 {game_id} 的 sample_count 与 manifest 不一致"
                 )
         return manifest
+
+    def _migrate_v1_manifest(
+        self, manifest: dict[str, object], raw: bytes
+    ) -> dict[str, object]:
+        expected = {
+            "schema_version": 1,
+            "encoding_version": ENCODING_VERSION,
+            "action_version": ACTION_VERSION,
+        }
+        for name, version in expected.items():
+            if manifest.get(name) != version:
+                raise ReplayCompatibilityError(
+                    f"Replay v1 {name} 不兼容：{manifest.get(name)!r} != {version}"
+                )
+        if set(manifest) != {*expected, "next_game_id", "games"}:
+            raise ReplayCompatibilityError("Replay v1 manifest 字段无效")
+        games = manifest.get("games")
+        next_game_id = manifest.get("next_game_id")
+        if not isinstance(games, list) or not all(type(item) is int for item in games):
+            raise ReplayCompatibilityError("Replay v1 games 清单无效")
+        if type(next_game_id) is not int or next_game_id <= 0:
+            raise ReplayCompatibilityError("Replay v1 next_game_id 无效")
+        total_games = next_game_id - 1
+        if (
+            any(game_id <= 0 for game_id in games)
+            or games != sorted(set(games))
+            or (games and games[-1] != total_games)
+            or games != list(range(total_games - len(games) + 1, total_games + 1))
+        ):
+            raise ReplayCompatibilityError("Replay v1 棋局 ID 或 next_game_id 无效")
+        sample_counts: dict[str, int] = {}
+        for game_id in games:
+            if not self._game_path(game_id).is_file():
+                raise ReplayCompatibilityError(f"Replay v1 棋局文件缺失：{game_id}")
+            data = self._read_game(game_id, schema_versions=(1,))
+            sample_counts[str(game_id)] = int(data["values"].shape[0])
+        migrated = {
+            **manifest,
+            "schema_version": SCHEMA_VERSION,
+            "total_games": total_games,
+            "sample_counts": sample_counts,
+        }
+        # 所有旧字段和棋局文件都验证完毕后才原子发布，失败不会触碰 v1 manifest。
+        self._write_manifest(migrated)
+        self._legacy_manifest_hash = hashlib.sha256(raw).hexdigest()
+        return migrated
 
     def _write_manifest(self, manifest: dict[str, object]) -> None:
         payload = json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode(

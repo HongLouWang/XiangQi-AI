@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -9,12 +10,13 @@ import numpy as np
 import pytest
 import torch
 
-from ai.checkpoint import CheckpointManager
+from ai.checkpoint import CheckpointManager, TrainingProgress
 from ai.config import TrainingConfig
 from ai.control import RunControl
 from ai.encoding import ACTION_SIZE, INPUT_CHANNELS
 from ai.mcts import SearchState
 from ai.network import PolicyValueNetwork
+from ai.replay import SCHEMA_VERSION, ReplayBuffer
 from ai.self_play import GameResult, TrainingSample
 from ai.trainer import TorchEvaluator, Trainer, _devices_match, train_batch
 from xiangqi.board import Board
@@ -51,6 +53,25 @@ def filesystem_flaky_game(seed: int) -> GameResult:
     except FileExistsError:
         return one_sample_game(seed)
     raise RuntimeError(f"transient-{seed}")
+
+
+def _legacy_v1_replay(run_dir: Path, game: GameResult) -> str:
+    replay = ReplayBuffer(run_dir / "replay", capacity_games=10)
+    replay.append_game(game)
+    game_path = run_dir / "replay" / "games" / "000000000001.npz"
+    with np.load(game_path, allow_pickle=False) as stored:
+        payload = {key: stored[key] for key in stored.files}
+    payload["schema_version"] = np.asarray([1], dtype=np.int64)
+    with game_path.open("wb") as stream:
+        np.savez_compressed(stream, **payload)
+    manifest_path = run_dir / "replay" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["schema_version"] = 1
+    manifest.pop("total_games")
+    manifest.pop("sample_counts")
+    legacy = json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode()
+    manifest_path.write_bytes(legacy)
+    return hashlib.sha256(legacy).hexdigest()
 
 
 def _config(tmp_path: Path, **changes: object) -> TrainingConfig:
@@ -345,6 +366,67 @@ def test_forward_restore_generates_the_next_seed_without_repeating_games(
     Trainer(_config(tmp_path, target_games=3), game_factory=capture).run(resume=True)
 
     assert seeds == [26]
+
+
+def test_restore_once_accepts_exact_v1_predecessor_and_rewrites_checkpoint(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, target_games=2)
+    legacy_hash = _legacy_v1_replay(tmp_path, one_sample_game(24))
+    model = PolicyValueNetwork(channels=2, residual_blocks=1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    expected_model = {
+        name: tensor.detach().clone() for name, tensor in model.state_dict().items()
+    }
+    CheckpointManager(tmp_path).save(
+        model,
+        optimizer,
+        TrainingProgress(1, 2, 0),
+        config,
+        replay_manifest_hash=legacy_hash,
+        replay_manifest_version=1,
+        numpy_generator=np.random.default_rng(config.seed),
+    )
+
+    resumed = Trainer(config, game_factory=one_sample_game)
+    assert resumed.replay.legacy_manifest_hash == legacy_hash
+    resumed.restore()
+
+    assert resumed.progress.completed_games == 1
+    assert all(
+        torch.equal(expected_model[name], tensor)
+        for name, tensor in resumed.model.state_dict().items()
+    )
+    loaded = CheckpointManager(tmp_path).load_latest(
+        resumed.model,
+        resumed.optimizer,
+        expected_replay_manifest_hash=resumed.replay.manifest_hash,
+        expected_replay_manifest_version=resumed.replay.manifest_version,
+        numpy_generator=resumed.rng,
+    )
+    assert loaded.replay_manifest_hash == resumed.replay.manifest_hash
+    assert loaded.replay_manifest_version == SCHEMA_VERSION
+
+
+def test_v1_predecessor_does_not_allow_an_arbitrary_checkpoint_hash(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, target_games=2)
+    _legacy_v1_replay(tmp_path, one_sample_game(24))
+    model = PolicyValueNetwork(channels=2, residual_blocks=1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    CheckpointManager(tmp_path).save(
+        model,
+        optimizer,
+        TrainingProgress(1, 2, 0),
+        config,
+        replay_manifest_hash="f" * 64,
+        replay_manifest_version=1,
+        numpy_generator=np.random.default_rng(config.seed),
+    )
+
+    with pytest.raises(RuntimeError, match="hash"):
+        Trainer(config, game_factory=one_sample_game).restore()
 
 
 def test_pause_is_safe_and_checkpoint_can_be_loaded(tmp_path: Path) -> None:
