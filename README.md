@@ -12,7 +12,9 @@ ResNet、PUCT MCTS 和自我对弈循环。它只复用规则引擎来生成合�
 结束。
 
 完整的安装、CPU/CUDA 配置、暂停、追加、断点续传和故障排查说明见
-[AI 训练使用手册](docs/AI-TRAINING-GUIDE.md)。
+[AI 训练使用手册](docs/AI-TRAINING-GUIDE.md)。需要在 Google Colab 使用 NVIDIA
+GPU，并把源码、临时文件和全部训练产物持久化到 Google Drive 时，可直接打开
+[Colab GPU 训练 Notebook](docs/XiangQi-AI-Colab-GPU-Training.ipynb)。
 
 安装训练和开发依赖：
 

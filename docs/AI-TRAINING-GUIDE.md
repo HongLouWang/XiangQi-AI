@@ -148,6 +148,11 @@ self_play_workers × torch_threads ≈ CPU 性能核心数
 
 ## 6. CUDA/GPU 训练
 
+如果本机没有 NVIDIA GPU，可以使用
+[Colab GPU 训练 Notebook](XiangQi-AI-Colab-GPU-Training.ipynb)。它会把源码、
+临时目录、依赖缓存、日志、Replay、checkpoint 和最终模型全部保存在 Google
+Drive 的 `MyDrive/XiangQi-AI/`，并提供暂停、追加和断点恢复单元格。
+
 先检测当前 PyTorch 是否能使用 CUDA：
 
 ```bash
