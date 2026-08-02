@@ -47,9 +47,11 @@ def _training_namespace(tmp_path: Path) -> dict[str, object]:
         "SOURCE_DIR": tmp_path / "source",
         "DRIVE_ROOT": tmp_path,
         "LOGS_DIR": tmp_path / "logs",
+        "LOCKS_DIR": tmp_path / "locks",
         "LOG_PATH": tmp_path / "logs" / "colab-gpu.log",
         "PID_PATH": tmp_path / "colab-training.pid",
-        "LOCK_DIR": run_dir / ".colab-training.lock",
+        "LOCK_DIR": tmp_path / "locks" / "colab-gpu.lock",
+        "RUN_NAME": "colab-gpu",
         "LOCK_STARTUP_GRACE_SECONDS": 120,
         "TARGET_GAMES": 10_000,
         "MAX_FULL_MOVES": 512,
@@ -62,6 +64,7 @@ def _training_namespace(tmp_path: Path) -> dict[str, object]:
         "GAME_RETRY_LIMIT": 2,
         "SEED": 0,
     }
+    namespace["LOCKS_DIR"].mkdir(parents=True, exist_ok=True)
     exec(  # noqa: S102 - 行为测试需要执行 Notebook 中受控的本地代码单元
         _code_cell_containing("def process_matches"), namespace
     )
@@ -136,6 +139,15 @@ def test_commands_are_argument_lists_and_pid_check_is_run_specific() -> None:
     assert "str(RUN_DIR).encode()" in source
     assert '"-m" in parts and "ai" in parts' in source
     assert "training_command(resume=True)" in source
+
+
+def test_training_lock_never_uses_run_dir() -> None:
+    source = _source()
+    assert 'LOCKS_DIR = DRIVE_ROOT / "locks"' in source
+    assert 'LOCK_DIR = LOCKS_DIR / f"{RUN_NAME}.lock"' in source
+    assert 'temporary = LOCKS_DIR / f".owner-{RUN_NAME}-{token}.tmp"' in source
+    assert 'stale_dir = LOCKS_DIR / f".{RUN_NAME}.stale-' in source
+    assert 'LOCK_DIR = RUN_DIR / ".colab-training.lock"' not in source
 
 
 def test_training_lock_atomically_rejects_a_competing_session(tmp_path: Path) -> None:
@@ -315,6 +327,65 @@ def test_live_pid_and_fresh_startup_lock_are_never_reclaimed(tmp_path: Path) -> 
     assert namespace["LOCK_DIR"].is_dir()
 
 
+def test_cleanup_failed_initial_run_removes_only_known_control_files(
+    tmp_path: Path,
+) -> None:
+    namespace = _training_namespace(tmp_path)
+    run_dir = namespace["RUN_DIR"]
+    run_dir.mkdir(parents=True)
+    (run_dir / "pause.json").write_text("{}")
+    (run_dir / "control.lock").write_text("")
+    legacy_lock = run_dir / ".colab-training.lock"
+    legacy_lock.mkdir()
+    (legacy_lock / "owner.json").write_text("{}")
+    namespace["PID_PATH"].write_text("987654\n")
+    namespace["process_matches"] = lambda pid: False
+
+    namespace["cleanup_failed_initial_run"]()
+
+    assert run_dir.is_dir()
+    assert not any(run_dir.iterdir())
+    assert not namespace["PID_PATH"].exists()
+
+
+@pytest.mark.parametrize(
+    "protected_name",
+    ["status.json", "checkpoint-a.pt", "checkpoint-b.pt", "final_model.pt"],
+)
+def test_cleanup_failed_initial_run_preserves_training_artifacts(
+    tmp_path: Path, protected_name: str
+) -> None:
+    namespace = _training_namespace(tmp_path)
+    run_dir = namespace["RUN_DIR"]
+    run_dir.mkdir(parents=True)
+    protected = run_dir / protected_name
+    protected.write_text("data")
+
+    with pytest.raises(RuntimeError, match="有效训练数据"):
+        namespace["cleanup_failed_initial_run"]()
+
+    assert protected.exists()
+
+
+def test_cleanup_failed_initial_run_rejects_live_process_and_unknown_lock_file(
+    tmp_path: Path,
+) -> None:
+    namespace = _training_namespace(tmp_path)
+    namespace["PID_PATH"].write_text("4321\n")
+    namespace["process_matches"] = lambda pid: pid == 4321
+    with pytest.raises(RuntimeError, match="PID=4321"):
+        namespace["cleanup_failed_initial_run"]()
+
+    namespace["process_matches"] = lambda pid: False
+    legacy_lock = namespace["RUN_DIR"] / ".colab-training.lock"
+    legacy_lock.mkdir(parents=True)
+    unknown = legacy_lock / "unexpected.bin"
+    unknown.write_bytes(b"keep")
+    with pytest.raises(RuntimeError, match="未知文件"):
+        namespace["cleanup_failed_initial_run"]()
+    assert unknown.exists()
+
+
 def test_training_argv_and_notebook_setup_order() -> None:
     notebook = _load()
     code_cells = [
@@ -384,6 +455,14 @@ def test_notebook_explains_full_move_limit_and_legal_endings() -> None:
     assert "1024 ply" in source
     assert "到达上限" in source and "和棋" in source
     assert "合法" in source and "将死" in source and "立即结束" in source
+
+
+def test_status_cell_reports_command_failure_before_reading_logs() -> None:
+    source = _code_cell_containing("log_lines[-100:]")
+    assert "subprocess.run(" in source
+    assert "check=False" in source
+    assert "status_result.returncode" in source
+    assert "status_result.stderr" in source
 
 
 def test_notebook_never_uses_unsafe_or_destructive_operations() -> None:
