@@ -169,6 +169,44 @@ def test_training_lock_safely_recovers_a_stale_owner(tmp_path: Path) -> None:
     assert metadata["token"] != "old-token"
 
 
+@pytest.mark.parametrize("created_at", [None, "not-a-timestamp"])
+def test_training_lock_uses_mtime_when_created_at_is_invalid(
+    tmp_path: Path, created_at: object
+) -> None:
+    namespace = _training_namespace(tmp_path)
+    lock_dir = namespace["LOCK_DIR"]
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "owner.json").write_text(
+        json.dumps(
+            {
+                "token": "old-token",
+                "run_dir": str(namespace["RUN_DIR"]),
+                "pid": 987654,
+                "created_at": created_at,
+            }
+        )
+    )
+    old_time = time.time() - 1_000
+    os.utime(lock_dir, (old_time, old_time))
+    namespace["process_matches"] = lambda pid: False
+    assert namespace["acquire_training_lock"]() != "old-token"
+
+
+def test_initial_metadata_failure_removes_own_empty_lock_and_allows_retry(
+    tmp_path: Path,
+) -> None:
+    namespace = _training_namespace(tmp_path)
+    original_write = namespace["_write_lock_metadata"]
+    namespace["_write_lock_metadata"] = lambda token, pid: (_ for _ in ()).throw(
+        OSError("drive unavailable")
+    )
+    with pytest.raises(OSError, match="drive unavailable"):
+        namespace["acquire_training_lock"]()
+    assert not namespace["LOCK_DIR"].exists()
+    namespace["_write_lock_metadata"] = original_write
+    assert namespace["acquire_training_lock"]()
+
+
 def test_popen_failure_releases_only_its_own_training_lock(
     tmp_path: Path,
 ) -> None:
@@ -237,6 +275,46 @@ def test_metadata_failure_stops_spawned_process_before_unlocking(
     assert not namespace["LOCK_DIR"].exists()
 
 
+def test_early_process_exit_releases_training_lock(tmp_path: Path) -> None:
+    namespace = _training_namespace(tmp_path)
+
+    class ExitedProcess:
+        pid = 4321
+
+        def poll(self) -> int:
+            return 1
+
+    namespace["subprocess"] = SimpleNamespace(
+        Popen=lambda *args, **kwargs: ExitedProcess(),
+        STDOUT=subprocess.STDOUT,
+        run=subprocess.run,
+        CompletedProcess=subprocess.CompletedProcess,
+        TimeoutExpired=subprocess.TimeoutExpired,
+    )
+    namespace["time"] = SimpleNamespace(
+        time=time.time, sleep=lambda seconds: None, monotonic=time.monotonic
+    )
+    with pytest.raises(RuntimeError, match="启动失败"):
+        namespace["start_background_training"]()
+    assert not namespace["LOCK_DIR"].exists()
+
+
+def test_live_pid_and_fresh_startup_lock_are_never_reclaimed(tmp_path: Path) -> None:
+    namespace = _training_namespace(tmp_path)
+    token = namespace["acquire_training_lock"]()
+    namespace["_write_lock_metadata"](token, pid=4321)
+    namespace["process_matches"] = lambda pid: pid == 4321
+    with pytest.raises(RuntimeError, match="PID=4321"):
+        namespace["acquire_training_lock"]()
+    assert namespace["LOCK_DIR"].is_dir()
+
+    namespace["process_matches"] = lambda pid: False
+    namespace["_write_lock_metadata"](token, pid=None)
+    with pytest.raises(RuntimeError, match="正在启动"):
+        namespace["acquire_training_lock"]()
+    assert namespace["LOCK_DIR"].is_dir()
+
+
 def test_training_argv_and_notebook_setup_order() -> None:
     notebook = _load()
     code_cells = [
@@ -270,12 +348,42 @@ def test_training_argv_and_notebook_setup_order() -> None:
     assert "--run-dir" in new_command and "--run-dir" in resume_command
 
 
+def test_pull_cell_rechecks_status_and_refuses_new_dirty_state() -> None:
+    pull_source = _code_cell_containing('"pull", "--ff-only"')
+    calls: list[list[str]] = []
+
+    def fake_run(
+        arguments: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        if "status" in arguments:
+            return subprocess.CompletedProcess(arguments, 0, stdout=" M README.md\n")
+        raise AssertionError("dirty source must never be pulled")
+
+    namespace = {
+        "SOURCE_DIR": Path("/drive/source"),
+        "source_status": "",
+        "subprocess": SimpleNamespace(run=fake_run),
+    }
+    exec(pull_source, namespace)  # noqa: S102 - 执行受控 Notebook 单元验证实际行为
+    assert len(calls) == 1
+    assert calls[0][-2:] == ["status", "--short"]
+
+
 def test_smoke_cell_is_idempotent_for_complete_artifacts() -> None:
     smoke_source = _code_cell_containing("SMOKE_RUN_DIR")
     assert "SMOKE_FINAL_MODEL" in smoke_source
     assert "SMOKE_CHECKPOINTS" in smoke_source
     assert "Smoke 已完成，跳过重复训练" in smoke_source
     assert "存在不完整数据" in smoke_source
+
+
+def test_notebook_explains_full_move_limit_and_legal_endings() -> None:
+    source = _source()
+    assert "512 个完整回合" in source
+    assert "1024 ply" in source
+    assert "到达上限" in source and "和棋" in source
+    assert "合法" in source and "将死" in source and "立即结束" in source
 
 
 def test_notebook_never_uses_unsafe_or_destructive_operations() -> None:
