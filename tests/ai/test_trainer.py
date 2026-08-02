@@ -18,9 +18,16 @@ from ai.mcts import SearchState
 from ai.network import PolicyValueNetwork
 from ai.replay import SCHEMA_VERSION, ReplayBuffer
 from ai.self_play import GameResult, TrainingSample
-from ai.trainer import TorchEvaluator, Trainer, _devices_match, train_batch
+from ai.trainer import (
+    TorchEvaluator,
+    Trainer,
+    _devices_match,
+    _parallel_game_candidates,
+    train_batch,
+)
 from xiangqi.board import Board
 from xiangqi.domain import Color
+from xiangqi.rules import all_legal_moves
 
 
 def _sample(value: float = 0.0) -> TrainingSample:
@@ -131,6 +138,27 @@ def test_torch_evaluator_uses_eval_no_grad_and_returns_numpy() -> None:
     assert isinstance(value, float)
     assert model.training
     assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_torch_evaluator_batch_matches_individual_evaluations() -> None:
+    model = PolicyValueNetwork(channels=2, residual_blocks=1)
+    evaluator = TorchEvaluator(model, torch.device("cpu"))
+    first = SearchState(Board.standard(), Color.RED)
+    move = all_legal_moves(first.board, first.side)[0]
+    states = (first, first.play(move))
+
+    batch_logits, batch_values = evaluator.evaluate_many(states)
+    individual = [evaluator.evaluate(state) for state in states]
+
+    np.testing.assert_allclose(
+        batch_logits,
+        np.stack([item[0] for item in individual]),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        batch_values, [item[1] for item in individual], rtol=1e-5, atol=1e-6
+    )
 
 
 @pytest.mark.parametrize("was_training", [True, False])
@@ -590,6 +618,73 @@ def test_cuda_mode_never_starts_cpu_self_play_workers(
     assert trainer.worker_count == 1
     assert trainer.worker_pids == {os.getpid()}
     assert "self_play_workers_effective=1" in RunControl(tmp_path).read_status().message
+
+
+def test_cuda_mode_uses_requested_parallel_game_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requested: list[tuple[int, int]] = []
+
+    class FakeBatchedSelfPlay:
+        last_batch_size = 0
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def generate(self, *, count: int, parallel_games: int):
+            requested.append((count, parallel_games))
+            self.last_batch_size = count
+            return [one_sample_game(index) for index in range(count)]
+
+    monkeypatch.setattr("ai.trainer.configure_device", lambda *_: torch.device("cpu"))
+    monkeypatch.setattr("ai.trainer.BatchedSelfPlay", FakeBatchedSelfPlay)
+    trainer = Trainer(
+        _config(tmp_path, device="cuda", parallel_games=4, target_games=3)
+    )
+
+    trainer.run()
+
+    assert requested == [(3, 4)]
+    status = RunControl(tmp_path).read_status()
+    assert "parallel_games_requested=4" in status.message
+    assert "parallel_games_effective=4" in status.message
+
+
+def test_parallel_game_candidates_halve_to_one() -> None:
+    assert _parallel_game_candidates(16) == (16, 8, 4, 2, 1)
+    assert _parallel_game_candidates(10) == (10, 5, 2, 1)
+
+
+def test_cuda_oom_retries_batch_at_lower_parallelism(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[int] = []
+
+    class OomOnceBatchedSelfPlay:
+        last_batch_size = 1
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def generate(self, *, count: int, parallel_games: int):
+            attempts.append(parallel_games)
+            if len(attempts) == 1:
+                raise torch.OutOfMemoryError("CUDA out of memory")
+            return [one_sample_game(index) for index in range(count)]
+
+    monkeypatch.setattr("ai.trainer.configure_device", lambda *_: torch.device("cpu"))
+    monkeypatch.setattr("ai.trainer.BatchedSelfPlay", OomOnceBatchedSelfPlay)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    trainer = Trainer(
+        _config(tmp_path, device="cuda", parallel_games=4, target_games=2)
+    )
+
+    trainer.run()
+
+    assert attempts == [4, 2]
+    assert trainer.parallel_games_effective == 2
+    assert trainer.oom_downgrades == 1
+    assert trainer.replay.total_games == 2
 
 
 def test_small_replay_commits_progress_before_training_is_possible(

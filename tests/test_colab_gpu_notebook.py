@@ -56,6 +56,7 @@ def _training_namespace(tmp_path: Path) -> dict[str, object]:
         "TARGET_GAMES": 10_000,
         "MAX_FULL_MOVES": 512,
         "DEVICE": "cuda:0",
+        "PARALLEL_GAMES": 16,
         "SIMULATIONS": 64,
         "CHANNELS": 64,
         "RESIDUAL_BLOCKS": 4,
@@ -118,6 +119,7 @@ def test_notebook_contains_complete_gpu_training_workflow() -> None:
         'DEVICE = "cuda:0"',
         "TARGET_GAMES = 10_000",
         "MAX_FULL_MOVES = 512",
+        "PARALLEL_GAMES = 16",
         "subprocess.Popen",
         "def process_matches",
         "def training_command",
@@ -130,6 +132,15 @@ def test_notebook_contains_complete_gpu_training_workflow() -> None:
         "ADDITIONAL_GAMES = 5_000",
     ):
         assert required in source
+
+
+def test_colab_training_commands_pass_parallel_games() -> None:
+    namespace = _training_namespace(Path("/tmp/notebook-parallel-contract"))
+    namespace["PARALLEL_GAMES"] = 16
+    new_command = namespace["training_command"](resume=False)
+    resume_command = namespace["training_command"](resume=True)
+    assert new_command[new_command.index("--parallel-games") + 1] == "16"
+    assert resume_command[resume_command.index("--parallel-games") + 1] == "16"
 
 
 def test_commands_are_argument_lists_and_pid_check_is_run_specific() -> None:

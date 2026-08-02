@@ -93,39 +93,18 @@ class MCTS:
             raise ValueError(f"{name} 必须是有限实数")
 
     def search(self, state: SearchState, *, add_noise: bool) -> dict[Move, float]:
+        session = self.start_search(state, add_noise=add_noise)
+        while not session.done:
+            request = session.next_evaluation()
+            if request is None:
+                continue
+            logits, value = self.evaluator.evaluate(request.state)
+            session.accept_evaluation(request, logits, value)
+        return session.policy()
+
+    def start_search(self, state: SearchState, *, add_noise: bool) -> SearchSession:
         self.root = Node(prior=1.0)
-
-        root_moves = all_legal_moves(state.board, state.side)
-        if not root_moves:
-            for _ in range(self.simulations):
-                self._backpropagate([], -1.0)
-            return {}
-
-        self._evaluate_and_expand(self.root, state, root_moves)
-        if add_noise:
-            self._add_root_noise()
-
-        for _ in range(self.simulations):
-            node = self.root
-            simulation_state = state
-            path: list[Node] = []
-
-            while node.children:
-                move, node = self._select_child(node)
-                simulation_state = simulation_state.play(move)
-                path.append(node)
-
-            legal_moves = all_legal_moves(simulation_state.board, simulation_state.side)
-            if not legal_moves:
-                leaf_value = -1.0
-            else:
-                leaf_value = self._evaluate_and_expand(
-                    node, simulation_state, legal_moves
-                )
-
-            self._backpropagate(path, float(leaf_value))
-
-        return self._visit_policy()
+        return SearchSession(self, state, add_noise=add_noise)
 
     def _evaluate_and_expand(
         self,
@@ -134,6 +113,16 @@ class MCTS:
         legal_moves: tuple[Move, ...],
     ) -> float:
         logits, value = self.evaluator.evaluate(state)
+        return self._expand_with_evaluation(node, state, legal_moves, logits, value)
+
+    def _expand_with_evaluation(
+        self,
+        node: Node,
+        state: SearchState,
+        legal_moves: tuple[Move, ...],
+        logits: NDArray[np.floating],
+        value: float,
+    ) -> float:
         if not np.isfinite(value) or not -1 <= value <= 1:
             raise ValueError("评估价值必须是 [-1, 1] 内的有限数")
         priors = legal_policy(logits, legal_moves, state.side)
@@ -181,3 +170,87 @@ class MCTS:
             move: child.visit_count / visits
             for move, child in self.root.children.items()
         }
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationRequest:
+    state: SearchState
+    node: Node
+    path: tuple[Node, ...]
+    legal_moves: tuple[Move, ...]
+    is_root: bool = False
+
+
+class SearchSession:
+    """每次最多暴露一个神经网络叶子评估请求的 MCTS 搜索。"""
+
+    def __init__(self, search: MCTS, state: SearchState, *, add_noise: bool) -> None:
+        self.search = search
+        self.state = state
+        self.add_noise = add_noise
+        self.completed_simulations = 0
+        self._initialized = False
+        self._pending: EvaluationRequest | None = None
+        root_moves = all_legal_moves(state.board, state.side)
+        if not root_moves:
+            for _ in range(search.simulations):
+                search._backpropagate([], -1.0)
+                self.completed_simulations += 1
+            self._initialized = True
+        else:
+            self._pending = EvaluationRequest(
+                state, search.root, (), root_moves, is_root=True
+            )
+
+    @property
+    def done(self) -> bool:
+        return (
+            self._initialized and self.completed_simulations >= self.search.simulations
+        )
+
+    def next_evaluation(self) -> EvaluationRequest | None:
+        if self._pending is not None:
+            return self._pending
+        while not self.done:
+            node = self.search.root
+            simulation_state = self.state
+            path: list[Node] = []
+            while node.children:
+                move, node = self.search._select_child(node)
+                simulation_state = simulation_state.play(move)
+                path.append(node)
+            legal_moves = all_legal_moves(simulation_state.board, simulation_state.side)
+            if not legal_moves:
+                self.search._backpropagate(path, -1.0)
+                self.completed_simulations += 1
+                continue
+            self._pending = EvaluationRequest(
+                simulation_state, node, tuple(path), legal_moves
+            )
+            return self._pending
+        return None
+
+    def accept_evaluation(
+        self,
+        request: EvaluationRequest,
+        logits: NDArray[np.floating],
+        value: float,
+    ) -> None:
+        if request is not self._pending:
+            raise ValueError("评估结果与当前待处理请求不匹配")
+        leaf_value = self.search._expand_with_evaluation(
+            request.node, request.state, request.legal_moves, logits, value
+        )
+        self._pending = None
+        if request.is_root:
+            self._initialized = True
+            if self.add_noise:
+                self.search._add_root_noise()
+            return
+        self.search._backpropagate(list(request.path), leaf_value)
+        self.completed_simulations += 1
+
+    def policy(self) -> dict[Move, float]:
+        if not self.done:
+            raise RuntimeError("搜索尚未完成")
+        return self.search._visit_policy()

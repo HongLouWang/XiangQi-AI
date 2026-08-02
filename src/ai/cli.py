@@ -68,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--device", default="auto", help="auto、cpu、cuda 或 cuda:N")
     train.add_argument("--torch-threads", type=_positive_int, default=1)
     train.add_argument("--self-play-workers", type=_positive_int, default=1)
+    train.add_argument("--parallel-games", type=_positive_int, default=16)
     train.add_argument("--simulations", type=_positive_int, default=64)
     train.add_argument("--residual-blocks", type=_positive_int, default=4)
     train.add_argument("--channels", type=_positive_int, default=64)
@@ -92,6 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=None,
         help="覆盖 CPU 自我对弈进程数",
+    )
+    resume.add_argument(
+        "--parallel-games",
+        type=_positive_int,
+        default=None,
+        help="覆盖 CUDA 单进程并行棋局数",
     )
 
     extend = commands.add_parser("extend", help="累计追加目标训练局数")
@@ -146,6 +153,7 @@ def _train(args: argparse.Namespace) -> None:
         device=args.device,
         torch_threads=args.torch_threads,
         self_play_workers=args.self_play_workers,
+        parallel_games=args.parallel_games,
         simulations_per_move=args.simulations,
         residual_blocks=args.residual_blocks,
         channels=args.channels,
@@ -168,6 +176,7 @@ def _resume(args: argparse.Namespace) -> None:
             "device": args.device,
             "torch_threads": args.torch_threads,
             "self_play_workers": args.self_play_workers,
+            "parallel_games": args.parallel_games,
         }.items()
         if value is not None
     }

@@ -193,9 +193,12 @@ CPU。
 语义已有自动化测试，但本机没有完成真实 NVIDIA GPU 烟雾训练。首次在 CUDA
 机器运行时，建议仍先使用 `--games 1 --full-moves 1 --simulations 1` 做验证。
 
-CUDA 模式下模型推理和训练位于 GPU；当前实现会把有效自我对弈 worker 数设为
-1，避免多个进程重复创建 CUDA context。可在 `status` 输出的 `message` 中查看
-`self_play_workers_effective`。
+CUDA 模式下模型推理和训练位于 GPU；有效自我对弈进程数仍为 1，避免多个进程
+重复创建 CUDA context。该进程通过 `--parallel-games`（默认 16）同步推进多盘
+棋，并把各盘 MCTS 叶子合并为一次网络 batch。明确发生 CUDA OOM 时，并行度会
+逐级减半直至 1；其他异常不会被当成 OOM。可在 `status` 的 `message` 中查看
+`self_play_workers_effective`、`parallel_games_requested`、
+`parallel_games_effective`、最近推理 batch 和 OOM 降级次数。
 
 ## 7. 暂停、恢复、追加和状态查询
 

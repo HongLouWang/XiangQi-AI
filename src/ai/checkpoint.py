@@ -257,6 +257,7 @@ class CheckpointManager:
             raise CheckpointCompatibilityError("checkpoint generation 无效")
         try:
             config_data = dict(payload["config"])
+            config_data.setdefault("parallel_games", 16)
             config_data["run_dir"] = Path(config_data["run_dir"])
             config = TrainingConfig(**config_data)
             progress = TrainingProgress(**payload["progress"])

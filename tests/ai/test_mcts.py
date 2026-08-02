@@ -81,6 +81,26 @@ def test_search_executes_exactly_the_requested_simulation_count() -> None:
     assert sum(child.visit_count for child in search.root.children.values()) == 8
 
 
+def test_search_session_yields_one_leaf_evaluation_at_a_time() -> None:
+    state = SearchState(Board.standard(), Color.RED)
+    search = MCTS(CountingEvaluator(), simulations=3, c_puct=1.5, seed=3)
+    session = search.start_search(state, add_noise=False)
+    evaluations = 0
+
+    while not session.done:
+        request = session.next_evaluation()
+        if request is None:
+            continue
+        evaluations += 1
+        session.accept_evaluation(
+            request, np.zeros(ACTION_SIZE, dtype=np.float32), 0.25
+        )
+
+    assert evaluations == 4  # 根节点一次，加三次 simulation 叶子
+    assert search.root.visit_count == 3
+    assert sum(session.policy().values()) == pytest.approx(1.0)
+
+
 def test_one_simulation_visits_one_root_edge() -> None:
     search = MCTS(CountingEvaluator(), simulations=1, c_puct=1.5, seed=3)
 

@@ -9,6 +9,7 @@ class TrainingConfig:
     device: str = "auto"
     torch_threads: int = 1
     self_play_workers: int = 1
+    parallel_games: int = 16
     simulations_per_move: int = 64
     residual_blocks: int = 4
     channels: int = 64
@@ -26,6 +27,7 @@ class TrainingConfig:
             "max_full_moves": self.max_full_moves,
             "torch_threads": self.torch_threads,
             "self_play_workers": self.self_play_workers,
+            "parallel_games": self.parallel_games,
             "simulations_per_move": self.simulations_per_move,
             "residual_blocks": self.residual_blocks,
             "channels": self.channels,

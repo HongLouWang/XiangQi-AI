@@ -65,6 +65,7 @@ def test_train_defaults_are_10000_games_and_512_full_moves(
     assert captured.config.target_games == 10_000
     assert captured.config.max_full_moves == 512
     assert captured.config.max_plies == 1024
+    assert captured.config.parallel_games == 16
     assert captured.resume is False
 
 
@@ -88,6 +89,8 @@ def test_train_accepts_runtime_and_network_overrides(
             "3",
             "--self-play-workers",
             "2",
+            "--parallel-games",
+            "8",
             "--simulations",
             "7",
             "--channels",
@@ -116,6 +119,7 @@ def test_train_accepts_runtime_and_network_overrides(
         device="cpu",
         torch_threads=3,
         self_play_workers=2,
+        parallel_games=8,
         simulations_per_move=7,
         residual_blocks=2,
         channels=16,
@@ -151,7 +155,7 @@ def test_resume_uses_persisted_target_and_architecture_without_cli_defaults(
     assert captured.resume is True
 
 
-def test_resume_only_overrides_device_threads_and_workers(
+def test_resume_only_overrides_device_threads_workers_and_parallel_games(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     saved = TrainingConfig(
@@ -176,6 +180,8 @@ def test_resume_only_overrides_device_threads_and_workers(
                 "6",
                 "--self-play-workers",
                 "4",
+                "--parallel-games",
+                "6",
             ]
         )
         == 0
@@ -185,6 +191,7 @@ def test_resume_only_overrides_device_threads_and_workers(
     assert captured.config.device == "cuda:0"
     assert captured.config.torch_threads == 6
     assert captured.config.self_play_workers == 4
+    assert captured.config.parallel_games == 6
     assert captured.config.channels == 2
     assert captured.config.residual_blocks == 1
     assert captured.config.max_full_moves == 11

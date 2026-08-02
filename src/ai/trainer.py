@@ -16,6 +16,7 @@ import torch
 from numpy.typing import NDArray
 from torch import nn
 
+from ai.batched_self_play import BatchedSelfPlay
 from ai.checkpoint import CheckpointManager, TrainingProgress
 from ai.config import TrainingConfig
 from ai.control import RunControl, RunStatus
@@ -27,6 +28,18 @@ from ai.self_play import GameResult, play_game
 
 GameFactory = Callable[[int], GameResult]
 LOGGER = logging.getLogger(__name__)
+
+
+def _parallel_game_candidates(requested: int) -> tuple[int, ...]:
+    if type(requested) is not int or requested <= 0:
+        raise ValueError("parallel_games 必须是正整数")
+    values: list[int] = []
+    current = requested
+    while True:
+        values.append(current)
+        if current == 1:
+            return tuple(values)
+        current = max(1, current // 2)
 
 
 def _devices_match(requested: torch.device, actual: torch.device) -> bool:
@@ -51,16 +64,34 @@ class TorchEvaluator:
         self.device = device
 
     def evaluate(self, state: SearchState) -> tuple[NDArray[np.float32], float]:
+        policies, values = self.evaluate_many((state,))
+        return policies[0], float(values[0])
+
+    def evaluate_many(
+        self, states: tuple[SearchState, ...] | list[SearchState]
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        if not states:
+            raise ValueError("批量评估至少需要一个局面")
         was_training = self.model.training
         self.model.eval()
         try:
-            inputs = torch.from_numpy(encode_board(state.board, state.side)).unsqueeze(
-                0
+            encoded = np.stack(
+                [encode_board(state.board, state.side) for state in states]
             )
-            with torch.no_grad():
-                logits, values = self.model(inputs.to(self.device))
-            policy = logits[0].detach().to("cpu", dtype=torch.float32).numpy().copy()
-            return policy, float(values.reshape(-1)[0].detach().cpu())
+            inputs = torch.from_numpy(encoded).to(
+                device=self.device, dtype=torch.float32
+            )
+            with torch.inference_mode():
+                logits, values = self.model(inputs)
+            policies = logits.detach().to("cpu", dtype=torch.float32).numpy().copy()
+            value_array = (
+                values.reshape(-1)
+                .detach()
+                .to("cpu", dtype=torch.float32)
+                .numpy()
+                .copy()
+            )
+            return policies, value_array
         finally:
             self.model.train(was_training)
 
@@ -232,8 +263,12 @@ class Trainer:
         self.control = RunControl(config.run_dir)
         self.rng = np.random.default_rng(config.seed)
         self.progress = TrainingProgress(0, config.target_games, 0)
-        cuda_mode = self.device.type == "cuda" or config.device.startswith("cuda")
-        self.worker_count = 1 if cuda_mode else config.self_play_workers
+        self.cuda_mode = self.device.type == "cuda" or config.device.startswith("cuda")
+        self.worker_count = 1 if self.cuda_mode else config.self_play_workers
+        self.parallel_games_requested = config.parallel_games
+        self.parallel_games_effective = config.parallel_games if self.cuda_mode else 1
+        self.last_inference_batch_size = 0
+        self.oom_downgrades = 0
         self.worker_pids: set[int] = set()
 
     def restore(self) -> None:
@@ -278,8 +313,17 @@ class Trainer:
             while True:
                 while self.progress.completed_games < self._live_target():
                     remaining = self._live_target() - self.progress.completed_games
-                    count = min(self.worker_count, remaining)
-                    results = self._generate_games(count, pool)
+                    count = min(
+                        self.parallel_games_effective
+                        if self.cuda_mode
+                        else self.worker_count,
+                        remaining,
+                    )
+                    results = (
+                        self._generate_cuda_games(count)
+                        if self.cuda_mode and self.game_factory is None
+                        else self._generate_games(count, pool)
+                    )
                     for result in results:
                         self.worker_pids.add(result.pid)
                         if result.game is None:  # pragma: no cover - 生成器保证成功
@@ -371,6 +415,41 @@ class Trainer:
                 next_pending[result.game_number] = (result.seed, result.attempt + 1)
             pending = next_pending
         return [completed[number] for number in sorted(completed)]
+
+    def _generate_cuda_games(self, count: int) -> list[_WorkerResult]:
+        candidates = _parallel_game_candidates(self.parallel_games_effective)
+        for index, parallel_games in enumerate(candidates):
+            evaluator = TorchEvaluator(self.model, self.device)
+            scheduler = BatchedSelfPlay(
+                evaluator,
+                simulations=self.config.simulations_per_move,
+                max_plies=self.config.max_plies,
+                seed=self.config.seed + self.progress.completed_games,
+            )
+            try:
+                games = scheduler.generate(count=count, parallel_games=parallel_games)
+            except torch.OutOfMemoryError:
+                if index + 1 >= len(candidates):
+                    raise
+                self.oom_downgrades += 1
+                self.parallel_games_effective = candidates[index + 1]
+                torch.cuda.empty_cache()
+                continue
+            self.parallel_games_effective = parallel_games
+            self.last_inference_batch_size = scheduler.last_batch_size
+            break
+        else:  # pragma: no cover - candidates 总是至少包含 1
+            raise AssertionError("缺少 CUDA 并行度候选")
+        return [
+            _WorkerResult(
+                os.getpid(),
+                game,
+                self.config.seed + self.progress.completed_games + offset,
+                self.progress.completed_games + offset,
+                1,
+            )
+            for offset, game in enumerate(games, start=1)
+        ]
 
     def _local_worker_entry(self, job: _WorkerJob) -> _WorkerResult:
         if self.game_factory is not None:
@@ -477,4 +556,12 @@ class Trainer:
 
     @property
     def _worker_message(self) -> str:
-        return f"self_play_workers_effective={self.worker_count}"
+        base = f"self_play_workers_effective={self.worker_count}"
+        if not self.cuda_mode:
+            return base
+        return (
+            f"{base}; parallel_games_requested={self.parallel_games_requested}; "
+            f"parallel_games_effective={self.parallel_games_effective}; "
+            f"last_inference_batch_size={self.last_inference_batch_size}; "
+            f"oom_downgrades={self.oom_downgrades}"
+        )
