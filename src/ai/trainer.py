@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import random
+import time
 import traceback
 from collections.abc import Callable
 from contextlib import suppress
@@ -16,10 +17,10 @@ import torch
 from numpy.typing import NDArray
 from torch import nn
 
-from ai.batched_self_play import BatchedSelfPlay
 from ai.checkpoint import CheckpointManager, TrainingProgress
 from ai.config import TrainingConfig
 from ai.control import RunControl, RunStatus
+from ai.cuda_pipeline import CudaSelfPlayPipeline
 from ai.encoding import ACTION_SIZE, encode_board
 from ai.mcts import MCTS, SearchState
 from ai.network import PolicyValueNetwork, configure_device
@@ -264,10 +265,20 @@ class Trainer:
         self.rng = np.random.default_rng(config.seed)
         self.progress = TrainingProgress(0, config.target_games, 0)
         self.cuda_mode = self.device.type == "cuda" or config.device.startswith("cuda")
-        self.worker_count = 1 if self.cuda_mode else config.self_play_workers
+        self.worker_count = (
+            min(config.self_play_workers, config.parallel_games)
+            if self.cuda_mode
+            else config.self_play_workers
+        )
+        self.worker_count_requested = config.self_play_workers
         self.parallel_games_requested = config.parallel_games
-        self.parallel_games_effective = config.parallel_games if self.cuda_mode else 1
+        self.parallel_games_effective = self.worker_count if self.cuda_mode else 1
+        self.active_games = 0
+        self.finished_games_in_session = 0
+        self.session_started_monotonic = time.monotonic()
         self.last_inference_batch_size = 0
+        self.max_inference_batch_size = 0
+        self.inference_requests = 0
         self.oom_downgrades = 0
         self.worker_pids: set[int] = set()
 
@@ -302,33 +313,63 @@ class Trainer:
 
     def run(self, *, resume: bool = False) -> None:
         pool: multiprocessing.pool.Pool | None = None
+        cuda_pipeline: CudaSelfPlayPipeline | None = None
         try:
             if resume:
                 self.restore()
                 self.control.clear_pause()
             self._write_status("running")
-            if self.worker_count > 1:
+            if self.cuda_mode:
+                cuda_pipeline = CudaSelfPlayPipeline(
+                    TorchEvaluator(self.model, self.device),
+                    worker_count=self.worker_count,
+                    max_active_games=self.parallel_games_effective,
+                    simulations_per_move=self.config.simulations_per_move,
+                    max_plies=self.config.max_plies,
+                    seed=self.config.seed,
+                    max_batch_size=self.parallel_games_effective,
+                    game_retry_limit=self.config.game_retry_limit,
+                    on_heartbeat=self._on_cuda_heartbeat,
+                    game_factory=self.game_factory,
+                )
+                cuda_pipeline.__enter__()
+            elif self.worker_count > 1:
                 pool = multiprocessing.get_context("spawn").Pool(self.worker_count)
 
             while True:
                 while self.progress.completed_games < self._live_target():
                     remaining = self._live_target() - self.progress.completed_games
-                    count = min(
-                        self.parallel_games_effective
-                        if self.cuda_mode
-                        else self.worker_count,
-                        remaining,
-                    )
-                    results = (
-                        self._generate_cuda_games(count)
-                        if self.cuda_mode and self.game_factory is None
-                        else self._generate_games(count, pool)
-                    )
+                    count = min(self.worker_count, remaining)
+                    if cuda_pipeline is not None:
+                        first_game = self.progress.completed_games + 1
+                        results = cuda_pipeline.generate(
+                            range(first_game, first_game + remaining)
+                        )
+                    else:
+                        results = self._generate_games(count, pool)
+                    pause_pending = False
                     for result in results:
                         self.worker_pids.add(result.pid)
                         if result.game is None:  # pragma: no cover - 生成器保证成功
                             raise AssertionError("成功结果缺少棋局")
                         self._commit_game(result.game)
+                        if cuda_pipeline is not None:
+                            self._sync_cuda_metrics(cuda_pipeline)
+                            self.finished_games_in_session += 1
+                            self._write_status("running")
+                            LOGGER.info(
+                                "self-play completed=%d/%d plies=%d "
+                                "termination=%s active=%d last_batch=%d "
+                                "max_batch=%d requests=%d",
+                                self.progress.completed_games,
+                                self.progress.target_games,
+                                result.game.plies,
+                                result.game.termination,
+                                self.active_games,
+                                self.last_inference_batch_size,
+                                self.max_inference_batch_size,
+                                self.inference_requests,
+                            )
                         pause = self.control.pause_requested()
                         periodic = (
                             self.progress.completed_games
@@ -338,10 +379,20 @@ class Trainer:
                         if pause or periodic:
                             self._save_checkpoint()
                         if pause:
-                            self.control.mark_paused(self.progress)
-                            return
-                        if self.progress.completed_games >= self._live_target():
+                            if cuda_pipeline is None:
+                                self.control.mark_paused(self.progress)
+                                return
+                            cuda_pipeline.stop_refilling()
+                            pause_pending = True
+                        if (
+                            not pause_pending
+                            and self.progress.completed_games >= self._live_target()
+                        ):
                             break
+                    if pause_pending:
+                        self._save_checkpoint()
+                        self.control.mark_paused(self.progress)
+                        return
 
                 self._save_checkpoint()
                 self.checkpoints.export_model(
@@ -355,6 +406,9 @@ class Trainer:
                     return
                 self._live_target()
                 self._write_status("running")
+        except KeyboardInterrupt:
+            self._save_checkpoint()
+            self.control.mark_paused(self.progress)
         except Exception as error:
             with suppress(Exception):
                 self._write_status("failed", message=str(error))
@@ -362,9 +416,35 @@ class Trainer:
                 self._save_checkpoint()
             raise
         finally:
+            if cuda_pipeline is not None:
+                cuda_pipeline.close()
             if pool is not None:
                 pool.close()
                 pool.join()
+
+    def _sync_cuda_metrics(self, pipeline: CudaSelfPlayPipeline) -> None:
+        self.parallel_games_effective = getattr(
+            pipeline, "max_active_games", self.parallel_games_effective
+        )
+        self.active_games = pipeline.active_games
+        self.last_inference_batch_size = pipeline.last_inference_batch_size
+        self.max_inference_batch_size = pipeline.max_inference_batch_size
+        self.inference_requests = pipeline.inference_requests
+        self.oom_downgrades = pipeline.oom_downgrades
+
+    def _on_cuda_heartbeat(self, pipeline: CudaSelfPlayPipeline) -> None:
+        self._sync_cuda_metrics(pipeline)
+        self._write_status("running")
+        LOGGER.info(
+            "self-play heartbeat completed=%d/%d active=%d last_batch=%d "
+            "max_batch=%d requests=%d",
+            self.progress.completed_games,
+            self.progress.target_games,
+            self.active_games,
+            self.last_inference_batch_size,
+            self.max_inference_batch_size,
+            self.inference_requests,
+        )
 
     def _generate_games(
         self, count: int, pool: multiprocessing.pool.Pool | None
@@ -373,10 +453,14 @@ class Trainer:
             self.config.seed + self.progress.completed_games + i + 1
             for i in range(count)
         ]
-        state_dict = {
-            name: tensor.detach().to("cpu").clone()
-            for name, tensor in self.model.state_dict().items()
-        }
+        state_dict = (
+            {
+                name: tensor.detach().to("cpu").clone()
+                for name, tensor in self.model.state_dict().items()
+            }
+            if self.game_factory is None
+            else {}
+        )
         pending = {
             self.progress.completed_games + offset + 1: (seed, 1)
             for offset, seed in enumerate(seeds)
@@ -415,41 +499,6 @@ class Trainer:
                 next_pending[result.game_number] = (result.seed, result.attempt + 1)
             pending = next_pending
         return [completed[number] for number in sorted(completed)]
-
-    def _generate_cuda_games(self, count: int) -> list[_WorkerResult]:
-        candidates = _parallel_game_candidates(self.parallel_games_effective)
-        for index, parallel_games in enumerate(candidates):
-            evaluator = TorchEvaluator(self.model, self.device)
-            scheduler = BatchedSelfPlay(
-                evaluator,
-                simulations=self.config.simulations_per_move,
-                max_plies=self.config.max_plies,
-                seed=self.config.seed + self.progress.completed_games,
-            )
-            try:
-                games = scheduler.generate(count=count, parallel_games=parallel_games)
-            except torch.OutOfMemoryError:
-                if index + 1 >= len(candidates):
-                    raise
-                self.oom_downgrades += 1
-                self.parallel_games_effective = candidates[index + 1]
-                torch.cuda.empty_cache()
-                continue
-            self.parallel_games_effective = parallel_games
-            self.last_inference_batch_size = scheduler.last_batch_size
-            break
-        else:  # pragma: no cover - candidates 总是至少包含 1
-            raise AssertionError("缺少 CUDA 并行度候选")
-        return [
-            _WorkerResult(
-                os.getpid(),
-                game,
-                self.config.seed + self.progress.completed_games + offset,
-                self.progress.completed_games + offset,
-                1,
-            )
-            for offset, game in enumerate(games, start=1)
-        ]
 
     def _local_worker_entry(self, job: _WorkerJob) -> _WorkerResult:
         if self.game_factory is not None:
@@ -556,12 +605,20 @@ class Trainer:
 
     @property
     def _worker_message(self) -> str:
-        base = f"self_play_workers_effective={self.worker_count}"
+        base = (
+            f"self_play_workers_requested={self.worker_count_requested}; "
+            f"self_play_workers_effective={self.worker_count}"
+        )
         if not self.cuda_mode:
             return base
         return (
             f"{base}; parallel_games_requested={self.parallel_games_requested}; "
             f"parallel_games_effective={self.parallel_games_effective}; "
+            f"active_games={self.active_games}; "
+            f"finished_games_in_session={self.finished_games_in_session}; "
             f"last_inference_batch_size={self.last_inference_batch_size}; "
-            f"oom_downgrades={self.oom_downgrades}"
+            f"max_inference_batch_size={self.max_inference_batch_size}; "
+            f"inference_requests={self.inference_requests}; "
+            f"oom_downgrades={self.oom_downgrades}; "
+            f"session_elapsed_seconds={int(time.monotonic() - self.session_started_monotonic)}"
         )

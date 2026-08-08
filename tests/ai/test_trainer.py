@@ -5,6 +5,7 @@ import json
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -604,50 +605,236 @@ def test_two_cpu_workers_are_real_spawned_processes(tmp_path: Path) -> None:
     assert len(trainer.worker_pids) == 2
 
 
-def test_cuda_mode_never_starts_cpu_self_play_workers(
+def test_cuda_mode_uses_requested_cpu_producers_up_to_parallel_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("ai.trainer.configure_device", lambda *_: torch.device("cpu"))
     trainer = Trainer(
-        _config(tmp_path, device="cuda", self_play_workers=4, target_games=1),
+        _config(
+            tmp_path,
+            device="cuda",
+            self_play_workers=4,
+            parallel_games=3,
+            target_games=1,
+        ),
         game_factory=one_sample_game,
     )
 
-    trainer.run()
-
-    assert trainer.worker_count == 1
-    assert trainer.worker_pids == {os.getpid()}
-    assert "self_play_workers_effective=1" in RunControl(tmp_path).read_status().message
+    assert trainer.worker_count == 3
+    assert trainer.parallel_games_effective == 3
 
 
-def test_cuda_mode_uses_requested_parallel_game_batch(
+def test_cuda_pipeline_commits_each_game_before_requesting_the_next_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    requested: list[tuple[int, int]] = []
+    observed_replay_counts: list[int] = []
 
-    class FakeBatchedSelfPlay:
-        last_batch_size = 0
+    class FakePipeline:
+        active_games = 2
+        last_inference_batch_size = 2
+        max_inference_batch_size = 2
+        inference_requests = 9
+        oom_downgrades = 0
+        processes: tuple[object, ...] = ()
 
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        def generate(self, *, count: int, parallel_games: int):
-            requested.append((count, parallel_games))
-            self.last_batch_size = count
-            return [one_sample_game(index) for index in range(count)]
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def generate(self, game_numbers):
+            numbers = iter(game_numbers)
+            first = next(numbers)
+            yield SimpleNamespace(
+                game_number=first, pid=4101, game=one_sample_game(first)
+            )
+            observed_replay_counts.append(trainer.replay.total_games)
+            second = next(numbers)
+            self.active_games = 1
+            yield SimpleNamespace(
+                game_number=second, pid=4102, game=one_sample_game(second)
+            )
 
     monkeypatch.setattr("ai.trainer.configure_device", lambda *_: torch.device("cpu"))
-    monkeypatch.setattr("ai.trainer.BatchedSelfPlay", FakeBatchedSelfPlay)
+    monkeypatch.setattr("ai.trainer.CudaSelfPlayPipeline", FakePipeline)
     trainer = Trainer(
-        _config(tmp_path, device="cuda", parallel_games=4, target_games=3)
+        _config(
+            tmp_path,
+            device="cuda",
+            self_play_workers=2,
+            parallel_games=4,
+            target_games=2,
+        )
     )
 
     trainer.run()
 
-    assert requested == [(3, 4)]
+    assert observed_replay_counts == [1]
+    assert trainer.worker_pids == {4101, 4102}
     status = RunControl(tmp_path).read_status()
+    assert status.completed_games == 2
+    assert "self_play_workers_requested=2" in status.message
+    assert "self_play_workers_effective=2" in status.message
     assert "parallel_games_requested=4" in status.message
-    assert "parallel_games_effective=4" in status.message
+    assert "parallel_games_effective=2" in status.message
+    assert "last_inference_batch_size=2" in status.message
+    assert "max_inference_batch_size=2" in status.message
+    assert "inference_requests=9" in status.message
+    assert "session_elapsed_seconds=" in status.message
+
+
+def test_cuda_pause_stops_refilling_and_drains_inflight_games(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stopped: list[bool] = []
+
+    class PausingPipeline:
+        active_games = 2
+        last_inference_batch_size = 1
+        max_inference_batch_size = 2
+        inference_requests = 4
+        oom_downgrades = 0
+        processes: tuple[object, ...] = ()
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def generate(self, game_numbers):
+            numbers = iter(game_numbers)
+            first = next(numbers)
+            RunControl(tmp_path).request_pause()
+            yield SimpleNamespace(
+                game_number=first, pid=4201, game=one_sample_game(first)
+            )
+            second = next(numbers)
+            self.active_games = 0
+            yield SimpleNamespace(
+                game_number=second, pid=4202, game=one_sample_game(second)
+            )
+
+        def stop_refilling(self) -> None:
+            stopped.append(True)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("ai.trainer.configure_device", lambda *_: torch.device("cpu"))
+    monkeypatch.setattr("ai.trainer.CudaSelfPlayPipeline", PausingPipeline)
+    trainer = Trainer(
+        _config(
+            tmp_path,
+            device="cuda",
+            self_play_workers=2,
+            parallel_games=2,
+            target_games=5,
+        )
+    )
+
+    trainer.run()
+
+    status = RunControl(tmp_path).read_status()
+    assert stopped
+    assert status.phase == "paused"
+    assert status.completed_games == 2
+
+
+def test_cuda_heartbeat_updates_status_before_first_game_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    heartbeat_messages: list[str] = []
+
+    class HeartbeatPipeline:
+        active_games = 2
+        last_inference_batch_size = 2
+        max_inference_batch_size = 2
+        inference_requests = 32
+        oom_downgrades = 0
+        processes: tuple[object, ...] = ()
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.on_heartbeat = kwargs["on_heartbeat"]
+
+        def __enter__(self):
+            return self
+
+        def generate(self, game_numbers):
+            self.on_heartbeat(self)
+            heartbeat_messages.append(RunControl(tmp_path).read_status().message)
+            number = next(iter(game_numbers))
+            self.active_games = 0
+            yield SimpleNamespace(
+                game_number=number, pid=4401, game=one_sample_game(number)
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("ai.trainer.configure_device", lambda *_: torch.device("cpu"))
+    monkeypatch.setattr("ai.trainer.CudaSelfPlayPipeline", HeartbeatPipeline)
+    Trainer(
+        _config(
+            tmp_path,
+            device="cuda",
+            self_play_workers=2,
+            parallel_games=2,
+            target_games=1,
+        )
+    ).run()
+
+    assert "active_games=2" in heartbeat_messages[0]
+    assert "inference_requests=32" in heartbeat_messages[0]
+
+
+def test_cuda_keyboard_interrupt_saves_checkpoint_and_marks_paused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class InterruptedPipeline:
+        active_games = 1
+        last_inference_batch_size = 1
+        max_inference_batch_size = 1
+        inference_requests = 1
+        oom_downgrades = 0
+        processes: tuple[object, ...] = ()
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def generate(self, game_numbers):
+            raise KeyboardInterrupt
+            yield  # pragma: no cover
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("ai.trainer.configure_device", lambda *_: torch.device("cpu"))
+    monkeypatch.setattr("ai.trainer.CudaSelfPlayPipeline", InterruptedPipeline)
+    trainer = Trainer(
+        _config(
+            tmp_path,
+            device="cuda",
+            self_play_workers=1,
+            parallel_games=1,
+            target_games=2,
+        )
+    )
+
+    trainer.run()
+
+    assert RunControl(tmp_path).read_status().phase == "paused"
+    assert CheckpointManager(tmp_path).has_checkpoint()
 
 
 def test_parallel_game_candidates_halve_to_one() -> None:
@@ -655,36 +842,51 @@ def test_parallel_game_candidates_halve_to_one() -> None:
     assert _parallel_game_candidates(10) == (10, 5, 2, 1)
 
 
-def test_cuda_oom_retries_batch_at_lower_parallelism(
+def test_cuda_pipeline_reports_oom_downgrade_metrics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    attempts: list[int] = []
-
-    class OomOnceBatchedSelfPlay:
+    class OomRecoveredPipeline:
+        active_games = 0
+        max_active_games = 1
         last_batch_size = 1
+        last_inference_batch_size = 1
+        max_inference_batch_size = 2
+        inference_requests = 3
+        oom_downgrades = 1
+        processes: tuple[object, ...] = ()
 
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        def generate(self, *, count: int, parallel_games: int):
-            attempts.append(parallel_games)
-            if len(attempts) == 1:
-                raise torch.OutOfMemoryError("CUDA out of memory")
-            return [one_sample_game(index) for index in range(count)]
+        def __enter__(self):
+            return self
+
+        def generate(self, game_numbers):
+            number = next(iter(game_numbers))
+            yield SimpleNamespace(
+                game_number=number, pid=4301, game=one_sample_game(number)
+            )
+
+        def close(self) -> None:
+            return None
 
     monkeypatch.setattr("ai.trainer.configure_device", lambda *_: torch.device("cpu"))
-    monkeypatch.setattr("ai.trainer.BatchedSelfPlay", OomOnceBatchedSelfPlay)
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr("ai.trainer.CudaSelfPlayPipeline", OomRecoveredPipeline)
     trainer = Trainer(
-        _config(tmp_path, device="cuda", parallel_games=4, target_games=2)
+        _config(
+            tmp_path,
+            device="cuda",
+            self_play_workers=4,
+            parallel_games=4,
+            target_games=1,
+        )
     )
 
     trainer.run()
 
-    assert attempts == [4, 2]
-    assert trainer.parallel_games_effective == 2
     assert trainer.oom_downgrades == 1
-    assert trainer.replay.total_games == 2
+    assert trainer.parallel_games_effective == 1
+    assert "oom_downgrades=1" in RunControl(tmp_path).read_status().message
 
 
 def test_small_replay_commits_progress_before_training_is_possible(

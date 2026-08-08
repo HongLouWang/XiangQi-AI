@@ -67,8 +67,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--device", default="auto", help="auto、cpu、cuda 或 cuda:N")
     train.add_argument("--torch-threads", type=_positive_int, default=1)
-    train.add_argument("--self-play-workers", type=_positive_int, default=1)
-    train.add_argument("--parallel-games", type=_positive_int, default=16)
+    train.add_argument(
+        "--self-play-workers",
+        type=_positive_int,
+        default=1,
+        help="CPU 生产进程数（CPU/CUDA 模式都生效，默认 1）",
+    )
+    train.add_argument(
+        "--parallel-games",
+        type=_positive_int,
+        default=16,
+        help="CUDA 最多在途棋局数（默认 16）",
+    )
     train.add_argument("--simulations", type=_positive_int, default=64)
     train.add_argument("--residual-blocks", type=_positive_int, default=4)
     train.add_argument("--channels", type=_positive_int, default=64)
@@ -92,13 +102,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--self-play-workers",
         type=_positive_int,
         default=None,
-        help="覆盖 CPU 自我对弈进程数",
+        help="覆盖 CPU 生产进程数（CPU/CUDA 模式都生效）",
     )
     resume.add_argument(
         "--parallel-games",
         type=_positive_int,
         default=None,
-        help="覆盖 CUDA 单进程并行棋局数",
+        help="覆盖 CUDA 最多在途棋局数",
     )
 
     extend = commands.add_parser("extend", help="累计追加目标训练局数")

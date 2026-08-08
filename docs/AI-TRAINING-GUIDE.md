@@ -173,7 +173,9 @@ PY
 python -m ai train \
   --run-dir AI-runs/gpu-main \
   --games 10000 \
-  --device cuda
+  --device cuda \
+  --self-play-workers 4 \
+  --parallel-games 16
 ```
 
 指定第 0 张 GPU：
@@ -193,12 +195,26 @@ CPU。
 语义已有自动化测试，但本机没有完成真实 NVIDIA GPU 烟雾训练。首次在 CUDA
 机器运行时，建议仍先使用 `--games 1 --full-moves 1 --simulations 1` 做验证。
 
-CUDA 模式下模型推理和训练位于 GPU；有效自我对弈进程数仍为 1，避免多个进程
-重复创建 CUDA context。该进程通过 `--parallel-games`（默认 16）同步推进多盘
-棋，并把各盘 MCTS 叶子合并为一次网络 batch。明确发生 CUDA OOM 时，并行度会
-逐级减半直至 1；其他异常不会被当成 OOM。可在 `status` 的 `message` 中查看
-`self_play_workers_effective`、`parallel_games_requested`、
-`parallel_games_effective`、最近推理 batch 和 OOM 降级次数。
+CUDA 模式下，多个 CPU 生产进程各自生成棋局和 MCTS 搜索请求，主进程
+独占 CUDA context，将来自不同 worker 的请求合并后在单张 GPU 上推理。
+`--self-play-workers` 是 CPU 生产进程数；`--parallel-games`（默认 16）是最多
+在途棋局数，不是保证同时活跃的棋局数。有效 worker 数不会超过这个上限。
+
+每完成一局，训练器都会立即提交 Replay 并更新状态；定期 checkpoint 仍由
+`--checkpoint-interval-games` 决定。因此完成局数不再需要等待整组在途棋局
+全部结束才可见。可在 `status` 的 `message` 中观察
+`self_play_workers_requested`、`self_play_workers_effective`、
+`parallel_games_requested`、`parallel_games_effective`、`active_games`、
+`last_inference_batch_size`、`max_inference_batch_size` 和 `inference_requests`。
+
+调参时先根据 CPU 核数增加 `--self-play-workers`，再观察实际推理 batch 和
+GPU 利用率，最后才增加 `--parallel-games`。T4 等 GPU 搭配较少 CPU 核时，
+合法着法生成和 MCTS 树操作可能是主要瓶颈；显存很空不代表应先扩大网络
+或在途棋局上限。
+
+Colab 正式训练应在 Notebook 单元格前台运行，以便会话持续跟踪活跃
+计算。不要把长时训练作为脱离 Notebook 的后台子进程；Colab 仍可能因配额、
+网络或 runtime 回收而中断，所以必须保留 Drive 中的整个运行目录以断点续传。
 
 ## 7. 暂停、恢复、追加和状态查询
 
@@ -217,7 +233,7 @@ python -m ai status --run-dir AI-runs/cpu-main
 - `target_games`：当前累计目标；
 - `training_steps`：已经执行的梯度更新次数；
 - `device`：实际训练设备；
-- `message`：有效 worker 数或错误摘要。
+- `message`：worker/在途棋局/推理 batch 指标，或错误摘要。
 
 ### 安全暂停
 
@@ -348,7 +364,8 @@ Trainer(config).run()
 | `max_full_moves` | 单局完整回合上限 | `512` |
 | `device` | `auto`、`cpu`、`cuda` 或 `cuda:N` | `auto` |
 | `torch_threads` | 每个 PyTorch 进程的线程数 | `1` |
-| `self_play_workers` | CPU 自我对弈进程数 | `1` |
+| `self_play_workers` | CPU 自我对弈生产进程数（CPU/CUDA 都生效） | `1` |
+| `parallel_games` | CUDA 最多在途棋局数 | `16` |
 | `simulations_per_move` | 每步 MCTS 模拟次数 | `64` |
 | `residual_blocks` | ResNet 残差块数 | `4` |
 | `channels` | 网络主干通道数 | `64` |
@@ -392,10 +409,13 @@ python -m ai train \
 python -m ai train \
   --run-dir AI-runs/gpu-main \
   --games 10000 --full-moves 512 \
-  --device cuda:0 --simulations 64
+  --device cuda:0 --self-play-workers 4 --parallel-games 16 \
+  --simulations 64
 ```
 
-如果显存不足，优先降低 `--batch-size`、`--channels` 或 `--residual-blocks`。
+先使 worker 数与可用 CPU 核数匹配，再根据状态中的实际推理 batch 调整
+`--parallel-games`。如果显存不足，优先降低 `--batch-size`、`--channels` 或
+`--residual-blocks`。
 
 ## 11. 常见问题与安全恢复
 
@@ -458,7 +478,7 @@ python -m ai train
 python -m ai train --device cpu --torch-threads 2 --self-play-workers 4
 
 # CUDA 训练
-python -m ai train --device cuda:0
+python -m ai train --device cuda:0 --self-play-workers 4 --parallel-games 16
 
 # 状态
 python -m ai status --run-dir AI-runs/default

@@ -56,6 +56,7 @@ def _training_namespace(tmp_path: Path) -> dict[str, object]:
         "TARGET_GAMES": 10_000,
         "MAX_FULL_MOVES": 512,
         "DEVICE": "cuda:0",
+        "SELF_PLAY_WORKERS": 4,
         "PARALLEL_GAMES": 16,
         "SIMULATIONS": 64,
         "CHANNELS": 64,
@@ -120,10 +121,9 @@ def test_notebook_contains_complete_gpu_training_workflow() -> None:
         "TARGET_GAMES = 10_000",
         "MAX_FULL_MOVES = 512",
         "PARALLEL_GAMES = 16",
-        "subprocess.Popen",
         "def process_matches",
         "def training_command",
-        "def start_background_training",
+        "def run_foreground_training",
         "def run_ai_command",
         '"pause"',
         '"extend"',
@@ -143,12 +143,32 @@ def test_colab_training_commands_pass_parallel_games() -> None:
     assert resume_command[resume_command.index("--parallel-games") + 1] == "16"
 
 
+def test_colab_training_commands_pass_dynamic_self_play_workers() -> None:
+    source = _source()
+    command_source = _code_cell_containing("def training_command")
+    assert "SELF_PLAY_WORKERS = max(1, min(8, os.cpu_count() or 1))" in source
+    assert '"--self-play-workers"' in command_source
+    namespace = _training_namespace(Path("/tmp/notebook-worker-contract"))
+    command = namespace["training_command"](resume=False)
+    assert command[command.index("--self-play-workers") + 1] == "4"
+
+
+def test_formal_training_and_resume_run_in_foreground() -> None:
+    new_training = _code_cell_containing("run_foreground_training(resume=False)")
+    resume_training = _code_cell_containing("run_foreground_training(resume=True)")
+    helper = _code_cell_containing("def run_foreground_training")
+    assert "subprocess.Popen" not in new_training
+    assert "subprocess.Popen" not in resume_training
+    assert "subprocess.run" in helper
+    assert "KeyboardInterrupt" in helper
+
+
 def test_commands_are_argument_lists_and_pid_check_is_run_specific() -> None:
     source = _source()
     assert "shell=True" not in source
     assert 'Path(f"/proc/{pid}/cmdline")' in source
     assert "str(RUN_DIR).encode()" in source
-    assert '"-m" in parts and "ai" in parts' in source
+    assert '"-m" in parts' in source and 'and "ai" in parts' in source
     assert "training_command(resume=True)" in source
 
 
@@ -230,95 +250,54 @@ def test_initial_metadata_failure_removes_own_empty_lock_and_allows_retry(
     assert namespace["acquire_training_lock"]()
 
 
-def test_popen_failure_releases_only_its_own_training_lock(
+def test_foreground_failure_releases_only_its_own_training_lock(
     tmp_path: Path,
 ) -> None:
     namespace = _training_namespace(tmp_path)
-    lock_existed_before_popen = False
+    lock_existed_before_run = False
 
-    class FailingPopen:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            nonlocal lock_existed_before_popen
-            lock_existed_before_popen = namespace["LOCK_DIR"].is_dir()
-            raise OSError("cannot start")
+    def failing_run(*args: object, **kwargs: object) -> object:
+        nonlocal lock_existed_before_run
+        lock_existed_before_run = namespace["LOCK_DIR"].is_dir()
+        raise OSError("cannot start")
 
     namespace["subprocess"] = SimpleNamespace(
-        Popen=FailingPopen,
+        run=failing_run,
         STDOUT=subprocess.STDOUT,
-        run=subprocess.run,
         CompletedProcess=subprocess.CompletedProcess,
     )
     with pytest.raises(OSError, match="cannot start"):
-        namespace["start_background_training"]()
-    assert lock_existed_before_popen
+        namespace["run_foreground_training"]()
+    assert lock_existed_before_run
     assert not namespace["LOCK_DIR"].exists()
 
 
-def test_metadata_failure_stops_spawned_process_before_unlocking(
-    tmp_path: Path,
-) -> None:
+def test_foreground_nonzero_exit_releases_training_lock(tmp_path: Path) -> None:
     namespace = _training_namespace(tmp_path)
 
-    class StartedProcess:
-        pid = 4321
-        terminated = False
-
-        def poll(self) -> None:
-            return None
-
-        def terminate(self) -> None:
-            self.terminated = True
-
-        def wait(self, timeout: int) -> int:
-            assert timeout == 30
-            return 0
-
-    process = StartedProcess()
     namespace["subprocess"] = SimpleNamespace(
-        Popen=lambda *args, **kwargs: process,
+        run=lambda *args, **kwargs: subprocess.CompletedProcess(args, 1),
         STDOUT=subprocess.STDOUT,
-        run=subprocess.run,
         CompletedProcess=subprocess.CompletedProcess,
-        TimeoutExpired=subprocess.TimeoutExpired,
     )
-    original_write = namespace["_write_lock_metadata"]
-    writes = 0
-
-    def fail_second_metadata_write(token: str, pid: int | None) -> None:
-        nonlocal writes
-        writes += 1
-        if writes == 2:
-            raise OSError("drive write failed")
-        original_write(token, pid)
-
-    namespace["_write_lock_metadata"] = fail_second_metadata_write
-    with pytest.raises(OSError, match="drive write failed"):
-        namespace["start_background_training"]()
-    assert process.terminated
+    result = namespace["run_foreground_training"]()
+    assert result.returncode == 1
     assert not namespace["LOCK_DIR"].exists()
 
 
-def test_early_process_exit_releases_training_lock(tmp_path: Path) -> None:
+def test_keyboard_interrupt_releases_foreground_training_lock(tmp_path: Path) -> None:
     namespace = _training_namespace(tmp_path)
 
-    class ExitedProcess:
-        pid = 4321
-
-        def poll(self) -> int:
-            return 1
+    def interrupt(*args: object, **kwargs: object) -> object:
+        raise KeyboardInterrupt
 
     namespace["subprocess"] = SimpleNamespace(
-        Popen=lambda *args, **kwargs: ExitedProcess(),
+        run=interrupt,
         STDOUT=subprocess.STDOUT,
-        run=subprocess.run,
         CompletedProcess=subprocess.CompletedProcess,
-        TimeoutExpired=subprocess.TimeoutExpired,
     )
-    namespace["time"] = SimpleNamespace(
-        time=time.time, sleep=lambda seconds: None, monotonic=time.monotonic
-    )
-    with pytest.raises(RuntimeError, match="启动失败"):
-        namespace["start_background_training"]()
+    with pytest.raises(KeyboardInterrupt):
+        namespace["run_foreground_training"]()
     assert not namespace["LOCK_DIR"].exists()
 
 

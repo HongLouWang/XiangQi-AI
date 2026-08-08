@@ -69,6 +69,16 @@ def test_train_defaults_are_10000_games_and_512_full_moves(
     assert captured.resume is False
 
 
+def test_train_help_explains_cuda_worker_and_parallel_game_limits(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["train", "--help"]) == 0
+
+    output = capsys.readouterr().out
+    assert "CPU 生产进程" in output
+    assert "最多在途棋局" in output
+
+
 def test_train_accepts_runtime_and_network_overrides(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

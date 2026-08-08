@@ -30,14 +30,16 @@ python -m pip install -e ".[ai,dev]"
 python -m ai train
 python -m ai train --games 20000 --full-moves 512 --device cpu \
   --torch-threads 8 --self-play-workers 8
-python -m ai train --device cuda:0 --parallel-games 16
+python -m ai train --device cuda:0 \
+  --self-play-workers 4 --parallel-games 16
 ```
 
 `--games` 是该运行目录的累计目标局数，不是每次额外新增的局数。CPU 模式可用
 `--torch-threads` 设置每个 PyTorch 进程的计算线程数，用
-`--self-play-workers` 设置并行自我对弈进程数。GPU 模式接受 `cuda` 或
-`cuda:N`；CUDA 使用单进程多局批量推理，`--parallel-games` 默认同时推进 16
-盘，显存不足时自动逐级减半至 1。显式选择 CUDA 而当前 PyTorch/CUDA 不可用时
+`--self-play-workers` 设置 CPU 自我对弈生产进程数，在 CPU 和 CUDA 模式都
+生效。GPU 模式接受 `cuda` 或 `cuda:N`；CUDA 由多个 CPU 生产进程发送
+MCTS 请求，主进程在单张 GPU 上合批推理。`--parallel-games` 是 CUDA 最多在途
+棋局数，默认 16，实际数量还受 worker 数和当前工作量限制。显式选择 CUDA 而当前 PyTorch/CUDA 不可用时
 会直接报错，不会静默退回 CPU。也可以在 Python 中构造 `TrainingConfig` 修改局数、回合上限、网络
 尺寸、MCTS 模拟次数、batch 和持久化间隔等参数。
 
